@@ -18,7 +18,7 @@ from utils import get_random_idx_split, download_url, extract_zip, decide_downlo
 
 class ActsTrack(InMemoryDataset):
 
-    def __init__(self, root, tesla, data_config, seed):
+    def __init__(self, root, tesla, data_config, seed, transform):
         self.url_raw = 'https://zenodo.org/record/7265547/files/actstrack_raw_2T.zip'
         self.url_processed = 'https://zenodo.org/record/7265547/files/actstrack_processed_2T.zip'
         self.tesla = tesla
@@ -30,7 +30,7 @@ class ActsTrack(InMemoryDataset):
 
         self.im_thres = data_config['im_thres']  # invariant mass threshold
 
-        super().__init__(root)
+        super().__init__(root, transform=transform)
         self.data, self.slices, self.idx_split = torch.load(self.processed_paths[0])
         self.x_dim = self.data.x.shape[1]
         self.pos_dim = self.data.pos.shape[1]
@@ -200,7 +200,7 @@ class ActsTrack(InMemoryDataset):
 
 
 if __name__ == '__main__':
-    data_config = yaml.safe_load(open('../configs/actstrack.yml'))['data']
+    data_config = yaml.safe_load(open('../configs/egnn_actstrack.yml'))['data']
     # for tesla in tqdm(['2T', '4T', '6T', '8T', '10T', '12T', '14T', '16T', '18T', '20T']):
     tesla = '2T'
     dataset = ActsTrack(root='../../data/actstrack', tesla=tesla, data_config=data_config, seed=42)

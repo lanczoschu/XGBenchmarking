@@ -36,7 +36,7 @@ class DGCNN(torch.nn.Module):
             mlp = MLP([hidden_size*3, hidden_size*2, hidden_size], 0.0, norm_type, act_type)
             self.convs.append(EdgeConv(mlp, hidden_size, norm_type, act_type, aggr='mean'))
 
-    def forward(self, x, pos, edge_attr, edge_index, batch, edge_attn=None, node_attn=None):
+    def forward(self, x, pos, edge_attr, edge_index, batch, edge_attn=None):
         if self.x_dim == 0 and self.pos_dim != 0:
             feats = pos
         elif self.x_dim != 0 and self.pos_dim == 0:

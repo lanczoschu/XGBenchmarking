@@ -1,23 +1,32 @@
 from pathlib import Path
 from torch_geometric.loader import DataLoader
 from datasets import ActsTrack, PLBind, Tau3Mu, SynMol
+from torch_geometric.nn import knn_graph, radius_graph
 
-
-def get_data_loaders(dataset_name, batch_size, data_config, seed):
+def get_data_loaders(dataset_name, batch_size, data_config, dataset_seed):
     data_dir = Path(data_config['data_dir'])
     assert dataset_name in ['tau3mu', 'plbind', 'synmol'] or 'acts' in dataset_name
 
     if 'actstrack' in dataset_name:
-        dataset_dir, tesla = dataset_name.split('_')
-        dataset = ActsTrack(data_dir / dataset_dir, tesla=tesla, data_config=data_config, seed=seed)
+        def act_transform(data):
+            com_pos = data.pos.norm(dim=-1, keepdim=True)
+            edge_index = knn_graph(com_pos, k=5, batch=data.batch, loop=True)
+            data.edge_index = edge_index
+            return data
+        tesla = '2T' if len(dataset_name.split('_')) == 1 else dataset_name.split('_')[-1]
+        dataset = ActsTrack(data_dir / 'actstrack', tesla=tesla, data_config=data_config, seed=dataset_seed, transform=act_transform)
         loaders, test_set = get_loaders_and_test_set(batch_size, dataset=dataset, idx_split=dataset.idx_split)
 
     elif dataset_name == 'tau3mu':
-        dataset = Tau3Mu(data_dir / 'tau3mu', data_config=data_config, seed=seed)
+        dataset = Tau3Mu(data_dir / 'tau3mu', data_config=data_config, seed=dataset_seed)
         loaders, test_set = get_loaders_and_test_set(batch_size, dataset=dataset, idx_split=dataset.idx_split)
 
     elif dataset_name == 'synmol':
-        dataset = SynMol(data_dir / 'synmol', data_config=data_config, seed=seed)
+        def syn_transform(data):
+            edge_index = knn_graph(data.pos, k=5, batch=data.batch, loop=True)
+            data.edge_index = edge_index
+            return data
+        dataset = SynMol(data_dir / 'synmol', data_config=data_config, seed=dataset_seed, transform=syn_transform)
         loaders, test_set = get_loaders_and_test_set(batch_size, dataset=dataset, idx_split=dataset.idx_split)
 
     elif dataset_name == 'plbind':

@@ -7,6 +7,7 @@ from backbones import DGCNN, PointTransformer, EGNN
 from utils import ExtractorMLP, MLP, CoorsNorm
 
 
+
 class Model(nn.Module):
     def __init__(self, model_name, model_config, method_name, method_config, dataset):
         super().__init__()
@@ -18,7 +19,7 @@ class Model(nn.Module):
         self.covar_dim = method_config.get('covar_dim', None)
         self.pos_coef = method_config.get('pos_coef', None)
         self.kr = method_config.get('kr', None)
-        if method_name == 'psat':
+        if method_name == 'lri_gaussian':
             assert self.pos_coef is not None and self.kr is not None
 
         out_dim = 1 if dataset.num_classes == 2 else dataset.num_classes
@@ -67,6 +68,9 @@ class Model(nn.Module):
         aux_info = {'raw_pos_dim': raw_pos_dim, 'dataset_name': dataset.dataset_name}
         self.coors_norm = CoorsNorm()
         self.mlp_out = MLP([hidden_size, hidden_size * 2, hidden_size, out_dim], dropout_p, norm_type, act_type)
+        self.spu_mlp_out = MLP([hidden_size, hidden_size * 2, hidden_size, out_dim], dropout_p, norm_type, act_type) \
+            if method_name == 'dir' else None
+
         if dataset.dataset_name != 'plbind':
             self.model = Model(dataset.x_dim, dataset.pos_dim, model_config, dataset.feat_info, aux_info=aux_info)
             self.emb_model = Model(dataset.x_dim, dataset.pos_dim, model_config, dataset.feat_info, aux_info=aux_info) if not self.one_encoder else None
@@ -78,35 +82,38 @@ class Model(nn.Module):
         self.dim_mapping = nn.Linear(1, 8)
         self.message_weights = ExtractorMLP(8, model_config, False, out_dim=1)
 
-    def forward(self, data, node_attn=None, edge_attn=None, node_noise=None):
-        x, pos, edge_index, edge_attr = self.calc_geo_feat(data.x, data.pos, data.batch, node_noise, self.method_name)
-
-        edge_attn = self.get_message_weights(x, pos, edge_index, data.batch) if self.method_name == 'psat' else edge_attn
+    def forward(self, data, edge_attn=None, node_noise=None):
+        x, pos, edge_index, edge_attr = self.calc_geo_feat(data, node_noise, self.method_name)
+        # edge_attr = self.calc_edge_attr(data.pos, data.edge_index)
+        edge_attn = self.get_message_weights(x, pos, edge_index, data.batch) if self.method_name == 'lri_gaussian' else edge_attn
         if self.dataset_name != 'plbind':
-            emb = self.model(x, pos, edge_attr, edge_index, data.batch, edge_attn=edge_attn, node_attn=node_attn)
+            emb = self.model(x, pos, edge_attr, edge_index, data.batch, edge_attn=edge_attn)
             pool_out = self.pool(emb, batch=data.batch)
         else:
-            _, _, edge_index_lig, edge_attr_lig = self.calc_geo_feat(data.x_lig, data.pos_lig, data.x_lig_batch, None, self.method_name, is_lig=True)
-            emb_rec = self.model(x, pos, edge_attr, edge_index, data.batch, edge_attn=edge_attn, node_attn=node_attn)
+            _, _, edge_index_lig, edge_attr_lig = self.calc_geo_feat(data, None, self.method_name, is_lig=True)
+            emb_rec = self.model(x, pos, edge_attr, edge_index, data.batch, edge_attn=edge_attn)
             emb_lig = self.model_lig(data.x_lig, data.pos_lig, edge_attr_lig, edge_index_lig, data.x_lig_batch)
             pool_out_rec, pool_out_lig = self.pool(emb_rec, batch=data.batch), self.pool(emb_lig, batch=data.x_lig_batch)
             pool_out = pool_out_rec + pool_out_lig
         return self.mlp_out(pool_out)
 
-    def get_emb(self, data):
-        x, pos, edge_index, edge_attr = self.calc_geo_feat(data.x, data.pos, data.batch, None, self.method_name)
+    def get_pred_from_emb(self, emb, batch):
+        pool_out = self.pool(emb, batch=batch)
+        return self.mlp_out(pool_out)
 
-        edge_attn = self.get_message_weights(x, pos, edge_index, data.batch) if self.method_name == 'psat' else None
+    def get_pred_from_spu_emb(self, emb, batch):
+        pool_out = self.pool(emb, batch=batch)
+        return self.spu_mlp_out(pool_out)
+
+    def get_emb(self, data, edge_attn=None):
+        x, pos, edge_index, edge_attr = self.calc_geo_feat(data, None, self.method_name)
+        # edge_attr = self.calc_edge_attr(data.pos, data.edge_index)
+        edge_attn = self.get_message_weights(x, pos, edge_index, data.batch) if self.method_name == 'lri_gaussian' else edge_attn
         if self.one_encoder:
             emb = self.model(x, pos, edge_attr, edge_index, data.batch, edge_attn=edge_attn)
         else:
             emb = self.emb_model(x, pos, edge_attr, edge_index, data.batch, edge_attn=edge_attn)
-
-        pool_out_lig = None
-        if self.dataset_name == 'plbind':
-            _, _, edge_index_lig, edge_attr_lig = self.calc_geo_feat(data.x_lig, data.pos_lig, data.x_lig_batch, None, self.method_name, is_lig=True)
-            pool_out_lig = self.pool(self.model_lig(data.x_lig, data.pos_lig, edge_attr_lig, edge_index_lig, data.x_lig_batch), batch=data.x_lig_batch)  # pool_out_lig
-        return [emb, pool_out_lig], edge_index
+        return emb, edge_index
 
     def get_message_weights(self, x, pos, edge_index, batch):
         col, row = edge_index
@@ -114,27 +121,28 @@ class Model(nn.Module):
         input_feat = self.dim_mapping(dist)
         return self.message_weights(input_feat, batch[col]).sigmoid()
 
-    def calc_geo_feat(self, x, pos, batch, node_noise, method_name, is_lig=False):
+    def calc_geo_feat(self, data, node_noise, method_name, is_lig=False):
+        x, pos, batch = (data.x_lig, data.pos_lig, data.x_lig_batch) if is_lig else (data.x, data.pos, data.batch)
         if 'actstrack' in self.dataset_name:
             pos = pos / 2955.5000 * 100 if self.pos_coef is None else pos / 2955.5000 * self.pos_coef
             pos = self.add_noise(pos, node_noise)
 
             pos = self.coors_norm(pos)
-            edge_index = knn_graph(pos, k=5 if self.kr is None else int(self.kr), batch=batch, loop=True)
+            edge_index = data.edge_index if 'lri' not in method_name else knn_graph(pos, k=5 if self.kr is None else int(self.kr), batch=batch, loop=True)
             edge_attr = self.calc_edge_attr(pos, edge_index)
 
         elif self.dataset_name == 'tau3mu':
             pos = pos * 1.0 if self.pos_coef is None else pos * self.pos_coef
             pos = self.add_noise(pos, node_noise)
 
-            edge_index = radius_graph(pos, r=1.0 if self.kr is None else self.kr * self.pos_coef, loop=True, batch=batch)
+            edge_index = data.edge_index if 'lri' not in method_name else radius_graph(pos, r=1.0 if self.kr is None else self.kr * self.pos_coef, loop=True, batch=batch)
             edge_attr = self.calc_edge_attr(pos, edge_index)
 
         elif self.dataset_name == 'synmol':
             pos = pos * 5.0 if self.pos_coef is None else pos * self.pos_coef
             pos = self.add_noise(pos, node_noise)
 
-            edge_index = knn_graph(pos, k=5 if self.kr is None else int(self.kr), batch=batch, loop=True)
+            edge_index = data.edge_index if 'lri' not in method_name else knn_graph(pos, k=5 if self.kr is None else int(self.kr), batch=batch, loop=True)
             edge_attr = self.calc_edge_attr(pos, edge_index)
 
         elif self.dataset_name == 'plbind':

@@ -1,3 +1,6 @@
+import os
+pre_cuda_id = int(os.environ.get('CUDA_VISIBLE_DEVICES')) if os.environ.get('CUDA_VISIBLE_DEVICES') else None
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5'
 import yaml
 import json
 import shutil
@@ -5,17 +8,22 @@ import argparse
 from tqdm import tqdm
 from pathlib import Path
 from copy import deepcopy
-from datetime import datetime
-
+from itertools import product
+import nni
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
-
+from eval import FidelEvaluation, LabelFidelity, AUCEvaluation
 from get_model import Model
-from baselines import LRIBern, LRIGaussian, Grad, BernMaskP, BernMask, PointMask
-from utils import to_cpu, log_epoch, get_data_loaders, get_precision_at_k_and_avgauroc_and_angles, set_seed, init_metric_dict, update_and_save_best_epoch_res, load_checkpoint, ExtractorMLP, get_optimizer
+from baselines import *
+from utils import to_cpu, log_epoch, get_data_loaders, set_seed, update_and_save_best_epoch_res, load_checkpoint, save_checkpoint, ExtractorMLP, get_optimizer
+from utils import inherent_models, post_hoc_explainers, post_hoc_attribution, name_mapping
+import torchmetrics
+from statistics import mean
+import warnings
+warnings.filterwarnings("ignore")
 
 
 def negative_augmentation(data, data_config, phase, data_loader, batch_idx, loader_len):
@@ -31,186 +39,204 @@ def negative_augmentation(data, data_config, phase, data_loader, batch_idx, load
     return data
 
 
-def eval_one_batch(baseline, optimizer, data, epoch, warmup, phase, method_name):
-    with torch.set_grad_enabled(method_name in ['gradcam', 'gradgeo', 'bernmask']):
+def eval_one_batch(baseline, optimizer, data, epoch, phase):
+    with torch.set_grad_enabled(baseline.name in ['gradcam', 'gradx', 'inter_grad', 'gnnexplainer']):
         assert optimizer is None
         baseline.extractor.eval() if hasattr(baseline, 'extractor') else None
         baseline.clf.eval()
 
-        # calc angle
-        # do_sampling = True if phase == 'valid' and method_name == 'lri_gaussian' else False
-
         # BernMaskP
-        do_sampling = True if phase == 'valid' and method_name == 'bernmask_p' else False # we find this is better for BernMaskP
-        loss, loss_dict, org_clf_logits, masked_clf_logits, node_attn, covar_mat, node_noise = baseline.forward_pass(data, epoch, warmup=warmup, do_sampling=do_sampling)
-        return loss_dict, to_cpu(org_clf_logits), to_cpu(masked_clf_logits), to_cpu(node_attn), to_cpu(covar_mat), to_cpu(node_noise)
+        do_sampling = True if phase == 'valid' and baseline.name == 'pgexplainer' else False # we find this is better for BernMaskP
+        loss, loss_dict, infer_clf_logits, node_attn = baseline.forward_pass(data, epoch=epoch, do_sampling=do_sampling)
+
+        return loss_dict, to_cpu(infer_clf_logits), to_cpu(node_attn)
 
 
-def train_one_batch(baseline, optimizer, data, epoch, warmup, phase, method_name):
+def train_one_batch(baseline, optimizer, data, epoch, phase):
     baseline.extractor.train() if hasattr(baseline, 'extractor') else None
-    baseline.clf.train() if (method_name != 'bernmask_p' or warmup) else baseline.clf.eval()
+    baseline.clf.train() if (baseline.name != 'pgexplainer' or phase == 'warm') else baseline.clf.eval()
 
-    loss, loss_dict, org_clf_logits, masked_clf_logits, node_attn, covar_mat, node_noise = baseline.forward_pass(data, epoch, warmup=warmup, do_sampling=True)
+    if phase == 'warm':
+        loss, loss_dict, org_clf_logits, node_attn = baseline.warming(data)
+    else:
+        loss, loss_dict, org_clf_logits, node_attn = baseline.forward_pass(data, epoch=epoch, do_sampling=True)
     optimizer.zero_grad()
-    loss.backward()
+
+    if baseline.name == 'test_inherent':
+        loss.backward(retain_graph=True)
+        data.node_grads += data.pos.grad.norm(dim=1, p=2)
+        data.edge_grads += data.edge_attn.grad
+    else:
+        loss.backward()
+
     optimizer.step()
-    return loss_dict, to_cpu(org_clf_logits), to_cpu(masked_clf_logits), to_cpu(node_attn), to_cpu(covar_mat), to_cpu(node_noise)
+    return loss_dict, to_cpu(org_clf_logits), to_cpu(node_attn)
 
 
-def run_one_epoch(baseline, optimizer, data_loader, epoch, phase, warmup, seed, signal_class, topk, writer, data_config, method_name):
-    loader_len = len(data_loader)
-    run_one_batch = train_one_batch if phase == 'train' else eval_one_batch
-    phase = 'test ' if phase == 'test' else phase  # align tqdm desc bar
-    log_dict = {k: [] for k in ['exp_labels', 'attn', 'clf_labels', 'org_clf_logits', 'masked_clf_logits', 'prec_at_k', 'prec_at_2k', 'prec_at_3k', 'avg_auroc', 'angles', 'eigen_ratio']}
-    all_loss_dict = {}
+def run_one_epoch(baseline, optimizer, data_loader, epoch, phase, seed, signal_class, writer=None, metric_list=None):
+    use_tqdm = True
+    run_one_batch = train_one_batch if optimizer else eval_one_batch
+    pbar, avg_loss_dict = tqdm(data_loader) if use_tqdm else data_loader, dict()
+    [eval_metric.reset() for eval_metric in metric_list] if phase in ['valid', 'test'] else None
 
-    pbar = tqdm(data_loader)
+    clf_ACC, clf_AUC = torchmetrics.Accuracy(task='binary'), torchmetrics.AUROC(task='binary')
     for idx, data in enumerate(pbar):
-        data = negative_augmentation(data, data_config, phase, data_loader, idx, loader_len)
+        # data = negative_augmentation(data, data_config, phase, data_loader, idx, loader_len)
+        loss_dict, clf_logits, attn = run_one_batch(baseline, optimizer, data.to(baseline.device), epoch, phase)
+        ex_labels, clf_labels, data = to_cpu(data.node_label), to_cpu(data.y), data.cpu()
 
-        loss_dict, org_clf_logits, masked_clf_logits, attn, covar_mat, _ = run_one_batch(baseline, optimizer, data.to(baseline.device), epoch, warmup, phase, method_name)
-        node_dir, poi_idx = to_cpu(data.get('node_dir', None)), to_cpu(data.get('poi_idx', None))
-        exp_labels, clf_labels, prec_at_k, prec_at_2k, prec_at_3k, avg_auroc, angles, eigen_ratio = to_cpu(data.node_label), to_cpu(data.y), [], [], [], [], [], []
+        eval_dict = {metric.name: metric.collect_batch(ex_labels, attn, data, signal_class, 'geometric')
+                     for metric in metric_list} if phase in ['valid', 'test'] else {}
+        eval_dict.update({'clf_acc': clf_ACC(clf_logits, clf_labels), 'clf_auc': clf_AUC(clf_logits, clf_labels)})
+        batch_fid = [eval_dict[k] for k in eval_dict if 'fid' in k and 'all' in k]
+        eval_dict.update({'mean_fid': mean(batch_fid)}) if phase in ['valid', 'test'] and batch_fid else {}
 
-        if not warmup:
-            exp_labels, attn, covar_mat, node_dir, attn_graph_id = get_relevant_nodes(exp_labels, attn, covar_mat, node_dir, data.batch.reshape(-1), data.y, signal_class)
-            prec_at_k, prec_at_2k, prec_at_3k, avg_auroc, angles,  _, eigen_ratio, _ = get_precision_at_k_and_avgauroc_and_angles(exp_labels, attn, covar_mat, node_dir, topk, attn_graph_id)
+        desc = log_epoch(seed, epoch, phase, loss_dict, eval_dict)
+        pbar.set_description(desc) if use_tqdm else None
+        # compute the avg_loss for the epoch desc
+        exec('for k, v in loss_dict.items():\n\tavg_loss_dict[k]=(avg_loss_dict.get(k, 0) * idx + v) / (idx + 1)')
 
-        for key in log_dict.keys():
-            if eval(key) is not None or warmup:
-                log_dict[key].append(eval(key))
-            else:
-                assert key in ['angles', 'eigen_ratio']
-                log_dict[key].append(torch.tensor([-1.0]))
+    epoch_dict = {eval_metric.name: eval_metric.eval_epoch() for eval_metric in metric_list} if metric_list else {}
+    epoch_dict.update({'clf_acc': clf_ACC.compute().item(), 'clf_auc': clf_AUC.compute().item()})
+    fid_score = [epoch_dict[k] for k in epoch_dict if 'fid' in k and 'all' in k]
+    epoch_dict.update({'mean_fid': mean(fid_score)}) if phase in ['valid', 'test'] and fid_score else {}
 
-        desc = log_epoch(epoch, phase, loss_dict, log_dict, seed, writer, warmup, batch=True)[0]
-        for k, v in loss_dict.items():
-            all_loss_dict[k] = all_loss_dict.get(k, 0) + v
-
-        if idx == loader_len - 1:
-            for k, v in all_loss_dict.items():
-                all_loss_dict[k] = v / loader_len
-            desc, org_clf_acc, org_clf_auc, masked_clf_acc, masked_clf_auc, exp_auc, prec_at_k, prec_at_2k, prec_at_3k, angles, eigen_ratio, avg_loss = log_epoch(epoch, phase, all_loss_dict, log_dict, seed, writer, warmup, batch=False)
-        pbar.set_description(desc)
-    return org_clf_acc, org_clf_auc, masked_clf_acc, masked_clf_auc, exp_auc, prec_at_k, prec_at_2k, prec_at_3k, angles, eigen_ratio, avg_loss
+    log_epoch(seed, epoch, phase, avg_loss_dict, epoch_dict, writer)
+    return epoch_dict
 
 
-def get_relevant_nodes(exp_labels, attn, covar_mat, node_dir, attn_graph_id, y, signal_class):
-    if signal_class is not None:
-        in_signal_class = (y[attn_graph_id] == signal_class).reshape(-1)
-        exp_labels, attn, attn_graph_id = exp_labels[in_signal_class], attn[in_signal_class], attn_graph_id[in_signal_class]
-        if node_dir is not None:
-            node_dir = node_dir[in_signal_class]
-        if covar_mat is not None:
-            covar_mat = covar_mat[in_signal_class]
-    return exp_labels, attn, covar_mat, node_dir, attn_graph_id
-
-
-def train(config, method_name, model_name, seed, dataset_name, log_dir, device):
-    writer = SummaryWriter(log_dir) if log_dir is not None else None
-    topk = config['logging']['topk']
+def train(config, method_name, model_name, backbone_seed, seed, dataset_name, parent_dir, device, main_metric, quick=False):
+    # writer = SummaryWriter(log_dir) if log_dir is not None else None
+    writer = None
+    model_dir, log_dir = (parent_dir / method_name, ) * 2 if method_name in inherent_models \
+        else (parent_dir / 'erm', None) if model_name in post_hoc_attribution \
+        else (parent_dir / 'erm', parent_dir / method_name)
+    # log_dir = parent_dir / method_name if method_name in inherent_models else None
+    log_dir.mkdir(parents=True, exist_ok=True) if log_dir is not None else None
+    model_dir.mkdir(parents=True, exist_ok=True)
 
     batch_size = config['optimizer']['batch_size']
+    model_cofig = config[method_name] if method_name in inherent_models else config['erm']
+    warmup = model_cofig['warmup']
     epochs = config[method_name]['epochs']
-    warmup = config[method_name]['warmup']
     data_config = config['data']
-    loaders, test_set, dataset = get_data_loaders(dataset_name, batch_size, data_config, seed)
+    loaders, test_set, dataset = get_data_loaders(dataset_name, batch_size, data_config, dataset_seed=0)
     signal_class = dataset.signal_class
 
-    clf = Model(model_name, config['model'][model_name], method_name, config[method_name], dataset).to(device)
-    extractor = ExtractorMLP(config['model'][model_name]['hidden_size'], config[method_name], config['data'].get('use_lig_info', False)) if 'grad' not in method_name else nn.Identity()
+    clf = Model(model_name, config[model_name],  # backbone_config
+                method_name, config[method_name],  # method_config
+                dataset).to(device)
+    extractor = ExtractorMLP(config[model_name]['hidden_size'], config[method_name], config['data'].get('use_lig_info', False)) \
+        if method_name in inherent_models + ['pgexplainer'] else nn.Identity()
     extractor = extractor.to(device)
     criterion = F.binary_cross_entropy_with_logits
+    constructor = eval(name_mapping[method_name])
+    optimizer = get_optimizer(clf, extractor, config['optimizer'], method_name, warmup=True)
 
-    if method_name == 'lri_bern':
-        baseline = LRIBern(clf, extractor, criterion, config['lri_bern'])
-    elif method_name == 'lri_gaussian':
-        baseline = LRIGaussian(clf, extractor, criterion, config['lri_gaussian'])
-    elif method_name == 'gradgeo':
-        baseline = Grad(clf, signal_class, criterion, config['gradgeo'])
-    elif method_name == 'gradcam':
-        baseline = Grad(clf, signal_class, criterion, config['gradcam'])
-    elif method_name == 'bernmask':
-        baseline = BernMask(clf, extractor, criterion, config['bernmask'])
-    elif method_name == 'bernmask_p':
-        baseline = BernMaskP(clf, extractor, criterion, config['bernmask_p'])
-    elif method_name == 'pointmask':
-        baseline = PointMask(clf, extractor, criterion, config['pointmask'])
+    # establish the model and the metrics
+    if method_name in inherent_models:
+        baseline = constructor(clf, extractor, criterion, config[method_name])
+        for epoch in range(1, warmup+1):
+            run_one_epoch(baseline, optimizer, loaders['train'], epoch, 'warm', seed, signal_class, writer)
+        metric_list = [AUCEvaluation()]
+    elif method_name in post_hoc_attribution + post_hoc_explainers:
+        baseline = constructor(clf, criterion, config[method_name]) if method_name != 'pgexplainer' else PGExplainer(clf, extractor, criterion, config['pgexplainer'])
+        if not load_checkpoint(baseline.clf, model_dir, model_name='erm', seed=backbone_seed, map_location=torch.device('cpu') if not torch.cuda.is_available() else None):
+            for epoch in range(1, warmup + 1):
+                run_one_epoch(baseline, optimizer, loaders['train'], epoch, 'warm', backbone_seed, signal_class, writer)
+            save_checkpoint(baseline.clf, model_dir, model_name='erm', backbone_seed=backbone_seed, seed=backbone_seed)
+        metric_list = [AUCEvaluation()] + [FidelEvaluation(baseline.clf, i/10) for i in range(2, 9)] + \
+                  [FidelEvaluation(baseline.clf, i/10, instance='pos') for i in range(2, 9)] + \
+                  [FidelEvaluation(baseline.clf, i/10, instance='neg') for i in range(2, 9)] if quick==False else \
+                  [AUCEvaluation()] + [FidelEvaluation(baseline.clf, i/10) for i in range(2, 9)]
+        baseline.start_tracking() if 'grad' in method_name or method_name == 'gnnlrp' else None
     else:
-        raise ValueError('Unknown method: {}'.format(method_name))
+        assert 'test' == method_name
+        baseline = Test(clf, criterion, config=None)
+        load_checkpoint(baseline.clf, model_dir, model_name='erm', seed=backbone_seed, map_location=torch.device('cpu') if not torch.cuda.is_available() else None)
+        # for epoch in range(1, warmup+1):
+        #     run_one_epoch(baseline, optimizer, loaders['train'], epoch, 'warm', seed, signal_class, writer)
+        metric_list = [AUCEvaluation()]
+        print('New method is ready!')
 
-    optimizer = get_optimizer(clf, extractor, config['optimizer'], config[method_name], warmup=True)
-    metric_dict = deepcopy(init_metric_dict)
-    for epoch in range(warmup):
-        train_res = run_one_epoch(baseline, optimizer, loaders['train'], epoch, 'train', warmup, seed, signal_class, topk, writer, data_config, method_name)
-        valid_res = run_one_epoch(baseline, None, loaders['valid'], epoch, 'valid', warmup, seed, signal_class, topk, writer, data_config, method_name)
-        test_res = run_one_epoch(baseline, None, loaders['test'], epoch, 'test', warmup, seed, signal_class, topk,  writer, data_config, method_name)
-        metric_dict = update_and_save_best_epoch_res(baseline, train_res, valid_res, test_res, metric_dict, epoch, log_dir, seed, topk, True, writer)
-
-    if method_name in ['gradcam', 'gradgeo', 'bernmask_p', 'bernmask']:
-        load_checkpoint(baseline, log_dir, model_name='wp_model')
-        if 'grad' in method_name: baseline.start_tracking()
-
-    warmup = 0
-    metric_dict = deepcopy(init_metric_dict)
-    clf.emb_model = deepcopy(clf.model) if not config[method_name].get('one_encoder', True) else None
-    optimizer = get_optimizer(clf, extractor, config['optimizer'], config[method_name], warmup=False)
-    for epoch in range(epochs):
-        if method_name in ['gradcam', 'gradgeo', 'bernmask']:
-            if method_name == 'bernmask':
-                train_res = None
-            else:
-                train_res = run_one_epoch(baseline, None, loaders['train'], epoch, 'test', warmup, seed, signal_class, topk, writer, data_config, method_name)
-            valid_res = run_one_epoch(baseline, None, loaders['valid'], epoch, 'test', warmup, seed, signal_class, topk, writer, data_config, method_name)
-            test_res = run_one_epoch(baseline, None, loaders['test'], epoch, 'test', warmup, seed, signal_class, topk,  writer, data_config, method_name)
-            if train_res is None:
-                train_res = valid_res
-        else:
-            train_res = run_one_epoch(baseline, optimizer, loaders['train'], epoch, 'train', warmup, seed, signal_class, topk, writer, data_config, method_name)
-            valid_res = run_one_epoch(baseline, None, loaders['valid'], epoch, 'valid', warmup, seed, signal_class, topk, writer, data_config, method_name)
-            test_res = run_one_epoch(baseline, None, loaders['test'], epoch, 'test', warmup, seed, signal_class, topk,  writer, data_config, method_name)
-
-        metric_dict = update_and_save_best_epoch_res(baseline, train_res, valid_res, test_res, metric_dict, epoch, log_dir, seed, topk, False, writer)
-        report_dict = {k.replace('metric/best_', ''): v for k, v in metric_dict.items()}  # for better readability
-    return report_dict
-
-
-def run_one_seed(dataset_name, method_name, model_name, cuda_id, seed, note, time):
     set_seed(seed)
-    config_name = dataset_name.split('_')[0]
-    sub_dataset_name = '_' + dataset_name.split('_')[1] if len(dataset_name.split('_')) > 1 else ''
-    config_path = Path('./configs') /  f'{config_name}.yml'
+    metric_names = [a + b for a, b in product(['valid_', 'test_'], [i.name for i in metric_list]+['clf_acc', 'clf_auc', 'mean_fid'])]
+    # metric_names = [j+i.name for i in metric_list for j in ['valid_', 'test_']]
+    metric_dict = {}.fromkeys(metric_names, 0)
+    optimizer = get_optimizer(clf, extractor, config['optimizer'], method_name, warmup=False)
+    for epoch in range(1, epochs+1):
+        if method_name in inherent_models + ['pgexplainer']:
+            run_one_epoch(baseline, optimizer, loaders['train'], epoch, 'train', seed, signal_class, writer, metric_list)
+        if method_name == 'subgraphx' or method_name == 'test':
+            # to save time, subgraphx is super time-consuming
+            test_dict = run_one_epoch(baseline, None, loaders['test'], epoch, 'test', seed, signal_class,  writer, metric_list)
+            valid_dict = test_dict
+        else:
+            valid_dict = run_one_epoch(baseline, None, loaders['valid'], epoch, 'valid', seed, signal_class, writer, metric_list)
+            test_dict = run_one_epoch(baseline, None, loaders['test'], epoch, 'test', seed, signal_class,  writer, metric_list)
+
+        # print(metric_dict)
+        metric_dict = update_and_save_best_epoch_res(baseline, metric_dict, valid_dict, test_dict, epoch, log_dir, backbone_seed, seed, writer, method_name, main_metric)
+        metric_dict.update({'default': metric_dict[f'valid_{main_metric}']})
+        nni.report_intermediate_result(metric_dict)
+
+    return metric_dict
+
+
+def run_one_seed(args, optimized_params):
+    print(args)
+    dataset_name, method_name, model_name, cuda_id, note = args.dataset, args.method, args.backbone, args.cuda, args.note
+    method_seed, backbone_seed = args.seed, args.bseed
+    main_metric = 'clf_auc' if method_name in inherent_models + ['test'] else 'mean_fid'
+    set_seed(backbone_seed)
+    config_name = '_'.join([model_name, dataset_name])
+    # sub_dataset_name = '_' + dataset_name.split('_')[1] if len(dataset_name.split('_')) > 1 else ''
+    config_path = Path('./configs') / f'{config_name}.yml'
     config = yaml.safe_load((config_path).open('r'))
     if config[method_name].get(model_name, False):
         config[method_name].update(config[method_name][model_name])
-    print('-' * 80), print('-' * 80)
-    print(f'Config: ', json.dumps(config, indent=4))
+    if optimized_params:
+        config[method_name].update(optimized_params)
+    print('=' * 80)
+    print(f'Config for {method_name}: ', json.dumps(config[method_name], indent=4))
 
-    device = torch.device(f'cuda:{cuda_id}' if cuda_id >= 0 else 'cpu')
-    log_dir = None
-    if config['logging']['tensorboard'] or method_name in ['gradcam', 'gradgeo', 'bernmask_p', 'bernmask']:
-        log_dir = Path(config['data']['data_dir']) / config_name / f'logs{sub_dataset_name}' / ('-'.join([time, method_name, model_name, 'seed'+str(seed), note]))
-        log_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(config_path, log_dir / config_path.name)
-    report_dict = train(config, method_name, model_name, seed, dataset_name, log_dir, device)
+    cuda_ = f'cuda:{pre_cuda_id}' if cuda_id == 99 else f'cuda:{cuda_id}' if cuda_id >= 0 else 'cpu'
+    device = torch.device(cuda_)
+    # log_dir = None
+    # if config['logging']['tensorboard'] or method_name in ['gradcam', 'gradgeo', 'bernmask_p', 'bernmask']:
+    main_dir = Path('log') / config_name
+    # the directory is like egnn_actstrack / bseed0 / lri_bern
+    main_dir.mkdir(parents=True, exist_ok=True)
+        # shutil.copy(config_path, log_dir / config_path.name)
+    report_dict = train(config, method_name, model_name, backbone_seed, method_seed, dataset_name, main_dir, device, main_metric, quick=args.quick)
     return report_dict
 
 
-def main():
-    time = datetime.now().strftime("%m_%d_%Y-%H_%M_%S.%f")[:-3]
-    parser = argparse.ArgumentParser(description='Train SAT')
+def main(args):
+    if args.gpu_ratio is not None:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_ratio)
+
+    params = nni.get_next_parameter()
+    report_dict = run_one_seed(args, params)
+    print(json.dumps(report_dict, indent=4))
+    # nni_report = dict(report_dict, **{'default': report_dict[f'valid_{main_metric}']})
+    nni.report_final_result(report_dict)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='EXP')
     parser.add_argument('-d', '--dataset', type=str, help='dataset used', default='actstrack_2T')
     parser.add_argument('-m', '--method', type=str, help='method used', default='lri_gaussian')
     parser.add_argument('-b', '--backbone', type=str, help='backbone used', default='egnn')
     parser.add_argument('--cuda', type=int, help='cuda device id, -1 for cpu', default=-1)
     parser.add_argument('--seed', type=int, help='random seed', default=0)
     parser.add_argument('--note', type=str, help='note in log name', default='')
-    args = parser.parse_args()
+    parser.add_argument('--gpu_ratio', type=float, help='gpu memory ratio', default=None)
+    parser.add_argument('--bseed', type=int, help='random seed for training backbone', default=0)
+    parser.add_argument('--quick', action="store_true", help='ignore some evaluation')
+    parser.add_argument('--no_tqdm', action="store_true", help='disable the tqdm')
 
-    print(args)
-    report_dict = run_one_seed(args.dataset, args.method, args.backbone, args.cuda, args.seed, args.note, time)
-    print(json.dumps(report_dict, indent=4))
-
-
-if __name__ == '__main__':
-    main()
+    exp_args = parser.parse_args()
+    use_tqdm = False if exp_args.no_tqdm else True
+    # sub_metric = 'avg_loss'
+    main(exp_args)

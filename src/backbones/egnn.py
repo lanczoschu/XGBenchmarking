@@ -29,7 +29,7 @@ class EGNN(nn.Module):
             conv = E_GCL_mask(hidden_size, hidden_size, hidden_size, edges_in_d=edges_in_d, nodes_attr_dim=0, act_fn=act_fn, norm_type=norm_type, recurrent=False, coords_weight=1.0, attention=False)
             self.convs.append(conv)
 
-    def forward(self, x, pos, edge_attr, edge_index, batch, edge_attn=None, node_attn=None):
+    def forward(self, x, pos, edge_attr, edge_index, batch, edge_attn=None):
         if self.x_dim == 0 and self.pos_dim != 0:
             feats = pos
         elif self.x_dim != 0 and self.pos_dim == 0:

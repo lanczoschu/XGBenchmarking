@@ -21,12 +21,12 @@ from utils import download_url, extract_zip, decide_download
 class SynMol(InMemoryDataset):
     ATOM_TYPES = ['C', 'N', 'O', 'S', 'F', 'P', 'Cl', 'Br', 'Na', 'Ca', 'I', 'B', 'H', '*']
 
-    def __init__(self, root, data_config, seed):
+    def __init__(self, root, data_config, seed, transform):
         self.url_raw = 'https://zenodo.org/record/7265547/files/synmol_raw.zip'
         self.url_processed = 'https://zenodo.org/record/7265547/files/synmol_processed.zip'
         self.seed = seed
 
-        super().__init__(root)
+        super().__init__(root, transform=transform)
         self.data, self.slices, self.idx_split = torch.load(self.processed_paths[0])
         self.x_dim = self.data.x.shape[1]
         self.pos_dim = self.data.pos.shape[1]
@@ -148,5 +148,5 @@ class SynMol(InMemoryDataset):
 
 
 if __name__ == '__main__':
-    data_config = yaml.safe_load(open('../configs/synmol.yml'))['data']
+    data_config = yaml.safe_load(open('../configs/egnn_synmol.yml'))['data']
     dataset = SynMol(root='../../data/synmol', data_config=data_config, seed=42)

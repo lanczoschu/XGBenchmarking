@@ -1,0 +1,107 @@
+import json
+import argparse
+from datetime import datetime
+import numpy as np
+import torch
+from trainer import run_one_seed
+import pandas as pd
+import warnings
+from utils import inherent_models, post_hoc_explainers, post_hoc_attribution
+from pathlib import Path
+warnings.filterwarnings("ignore")
+
+
+def get_avg_std_report(reports):
+    # print(reports)
+    all_keys = {k: [] for k in reports[0]}
+    for report in reports:
+        for k in report:
+            all_keys[k].append(report[k])
+    avg_report = {k: np.mean(v) for k, v in all_keys.items()}
+    std_report = {k: np.std(v) for k, v in all_keys.items()}
+    avg_std_report = {k: f'{np.mean(v):.3f} +/- {np.std(v):.3f}' for k, v in all_keys.items()}
+    return avg_report, std_report, avg_std_report
+
+
+def save_multi_result(method_res, method_name, all_methods, bseed, seeds, config_name):
+    seeds += ['avg', 'std'] if len(seeds) > 1 else []
+    indexes = [method_name+'_'+str(seed) for seed in seeds]
+
+    df = pd.DataFrame(method_res, index=indexes)
+
+    day_dir = Path('result') / config_name / datetime.now().strftime("%m_%d")
+    day_dir.mkdir(parents=True, exist_ok=True)
+    csv_dir = day_dir / ('_'.join(['bseed'+str(bseed)]+all_methods) + '.csv')
+    with open(csv_dir, mode='a') as f:
+        df.to_csv(f, lineterminator="\n", header=f.tell() == 0)
+    now_df = pd.read_csv(csv_dir, index_col=0)
+    return now_df
+
+
+def main(args):
+    if len(args.methods) == 1:
+        if args.methods[0] == 'all_inherent':
+            args.methods = inherent_models
+        elif args.methods[0] == 'all_attribution':
+            args.methods = post_hoc_attribution
+        elif args.methods[0] == 'all_explainer':
+            args.methods = ['subgraphx', 'pgmexplainer'] # post_hoc_explainers
+        else:
+            print(args.methods)
+            if args.methods[0] in inherent_models + post_hoc_attribution + post_hoc_explainers:
+                pass
+            else:
+                raise ValueError(f'Unknown experiment {args.methods[0]} except for explainer/attribution/inherent.')
+
+    # set method seeds
+    if set(args.methods) <= set(inherent_models):
+        args.seeds = [args.bseed]
+    elif set(args.methods) <= set(post_hoc_attribution):
+        args.seeds = [0]
+    elif set(args.methods) <= set(post_hoc_explainers):
+        args.seeds = list(range(0, 10))
+    else:
+        raise ValueError("Don't try to running methods of different kinds together.")
+
+    if args.gpu_ratio is not None:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_ratio)
+    multi_methods_res = []
+    config_name = '_'.join([args.backbone, args.dataset])
+    for method in args.methods:
+        args.method = method
+        multi_seeds_res = []
+        for seed in args.seeds:
+            args.seed = seed
+            report_dict = run_one_seed(args, None)
+            multi_seeds_res += [report_dict]
+            # print(json.dumps(report_dict, indent=4))
+        avg_report, std_report, avg_std_report = get_avg_std_report(multi_seeds_res)
+        multi_seeds_res += [avg_report, std_report] if len(args.seeds) > 1 else []
+        print(f'[{len(args.seeds)} seeds for {method} on {args.dataset} (classifier training seed: {args.bseed}) done]\n',
+              json.dumps(avg_std_report, indent=4))
+        multi_methods_df = save_multi_result(multi_seeds_res, method, args.methods, args.bseed, args.seeds, config_name)
+
+    print("=" * 80), print(multi_methods_df)
+
+
+if __name__ == '__main__':
+    time = datetime.now().strftime("%m_%d-%H_%M")
+    parser = argparse.ArgumentParser(description='EXP')
+    parser.add_argument('-d', '--dataset', type=str, help='dataset used')
+    parser.add_argument('-b', '--backbone', type=str, help='backbone used', default='egnn')
+    parser.add_argument('--cuda', type=int, help='cuda device id, -1 for cpu', default=-1)
+    parser.add_argument('--method', type=str, help='method used')
+    parser.add_argument('--seed', type=int, help='random seed')
+    parser.add_argument('--methods', type=str, help='methods tested', nargs='+')
+    parser.add_argument('--seeds', type=int, help='random seed', default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+    parser.add_argument('--note', type=str, help='note in log name', default='')
+    parser.add_argument('--gpu_ratio', type=float, help='gpu memory ratio', default=None)
+    parser.add_argument('--bseed', type=int, help='random seed for training backbone', default=0)
+    parser.add_argument('--quick', action="store_true", help='ignore some evaluation')
+    parser.add_argument('--no_tqdm', action="store_true", help='disable the tqdm')
+    args = parser.parse_args()
+    use_tqdm = False if args.no_tqdm else True
+    # main_metric = 'exp_auc'
+    # sub_metric = 'avg_loss'
+    main(args)

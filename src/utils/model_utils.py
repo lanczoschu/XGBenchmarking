@@ -108,9 +108,9 @@ class FeatEncoder(torch.nn.Module):
         return x_embedding
 
 
-def get_optimizer(clf, extractor, optimizer_config, method_config, warmup):
-    pred_lr = method_config['pred_lr']
-    pred_wd = method_config['pred_wd']
+def get_optimizer(clf, extractor, optimizer_config, method_name, warmup):
+    # pred_lr = method_config['pred_lr']
+    # pred_wd = method_config['pred_wd']
 
     wp_lr = optimizer_config['wp_lr']
     wp_wd = optimizer_config['wp_wd']
@@ -120,11 +120,13 @@ def get_optimizer(clf, extractor, optimizer_config, method_config, warmup):
     emb_wd = optimizer_config['emb_wd']
 
     algo = torch.optim.Adam
-    clf_emb_model_params = [kv[1]  for kv in clf.named_parameters() if 'emb_model' in kv[0]]
+    # clf_emb_model_params = [kv[1]  for kv in clf.named_parameters() if 'emb_model' in kv[0]]
     clf_base_params = [kv[1] for kv in clf.named_parameters() if 'emb_model' not in kv[0]]
 
     if warmup:
         return algo([{'params': clf_base_params}], lr=wp_lr, weight_decay=wp_wd)
+    if method_name == 'pgexplainer':
+        return algo([{'params': extractor.parameters()}], lr=attn_lr, weight_decay=attn_wd)
     else:
-        return algo([{'params': extractor.parameters(), 'lr': attn_lr, 'weight_decay': attn_wd}, {'params': clf_base_params},
-                     {'params': clf_emb_model_params, 'lr': emb_lr, 'weight_decay': emb_wd}], lr=pred_lr, weight_decay=pred_wd)
+        return algo([{'params': extractor.parameters(), 'lr': attn_lr, 'weight_decay': attn_wd},
+                     {'params': clf_base_params, 'lr': emb_lr, 'weight_decay': emb_wd}])

@@ -36,7 +36,7 @@ class PointTransformer(torch.nn.Module):
         for _ in range(self.n_layers):
             self.convs.append(TransformerBlock(hidden_size, hidden_size, pos_dim=self.raw_pos_dim))
 
-    def forward(self, x, pos, edge_attr, edge_index, batch, edge_attn=None, node_attn=None):
+    def forward(self, x, pos, edge_attr, edge_index, batch, edge_attn=None):
         if self.x_dim == 0 and self.pos_dim != 0:
             feats = pos
         elif self.x_dim != 0 and self.pos_dim == 0:
