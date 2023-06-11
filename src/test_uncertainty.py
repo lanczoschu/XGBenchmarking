@@ -35,9 +35,8 @@ def eval_one_batch(baseline, data, epoch):
 
 
 def one_seed_attn(baseline, data_loader, epoch, phase, seed, signal_class, writer=None, metric_list=None):
-
     # log_epoch(seed, epoch, phase, avg_loss_dict, epoch_dict, writer)
-    return epoch_attn, epoch_label
+    return
 
 def test_uncertainty(config, method_name, model_name, backbone_seed, method_seeds, dataset_name, log_dir, device):
     set_seed(backbone_seed)
@@ -70,6 +69,7 @@ def test_uncertainty(config, method_name, model_name, backbone_seed, method_seed
     map_location = torch.device('cpu') if not torch.cuda.is_available() else None
     epoch_avg_attn, epoch_std_attn, epoch_label, sig_spear, bkg_spear, all_spear = [], [], [], [], [], []
     # sp_list = []
+    multi_epoch_attn = None
     for idx, data in enumerate(pbar):
         if data.y.item() == 0:
             continue
@@ -79,8 +79,13 @@ def test_uncertainty(config, method_name, model_name, backbone_seed, method_seed
         for method_seed in method_seeds:
             baseline = eval(name_mapping[method_name])(clf, criterion, config[method_name]) \
                 if method_name != 'pgexplainer' else PGExplainer(clf, extractor, criterion, config['pgexplainer'])
-            assert load_checkpoint(baseline, log_dir, model_name=method_name, seed=method_seed, map_location=map_location,
+            if method_name == 'pgexplainer':
+                assert load_checkpoint(baseline, log_dir, model_name=method_name, seed=method_seed, map_location=map_location,
                                    backbone_seed=backbone_seed, verbose=False)
+            else:
+                pass
+                # print(f'Running {method_name} for seed {method_seed}.')
+
             erm_dir = log_dir.parent / 'erm'
             assert load_checkpoint(baseline.clf, erm_dir, model_name='erm', seed=backbone_seed, map_location=map_location, verbose=False)
             # data = negative_augmentation(data, data_config, phase, data_loader, idx, loader_len)
@@ -89,8 +94,11 @@ def test_uncertainty(config, method_name, model_name, backbone_seed, method_seed
             # print()
             eval_dict.update({'clf_acc': clf_ACC(clf_logits, clf_labels), 'clf_auc': clf_AUC(clf_logits, clf_labels)})
             eval_dict.update({f'exp_auc_{method_seed}': roc_auc_score(ex_labels, attn)})
-
             multi_attn = attn.unsqueeze(1) if multi_attn is None else torch.cat([multi_attn, attn.unsqueeze(1)], dim=1)
+
+        info_graph = torch.full((multi_attn.shape[0], 1), idx)
+        multi_attn_plus = torch.cat([multi_attn, ex_labels.unsqueeze(1), info_graph], dim=1)
+        multi_epoch_attn = multi_attn_plus if multi_epoch_attn is None else torch.cat([multi_epoch_attn, multi_attn_plus], dim=0)
 
         avg_attn, std_attn = torch.mean(multi_attn, dim=1), torch.std(multi_attn, dim=1)
         batch_exp_auc_avg, batch_exp_auc_std = roc_auc_score(ex_labels, avg_attn), roc_auc_score(ex_labels, 1-std_attn)
@@ -112,6 +120,12 @@ def test_uncertainty(config, method_name, model_name, backbone_seed, method_seed
     # epoch_dict = {eval_metric.name: eval_metric.eval_epoch(return_att=True) for eval_metric in metric_list} if metric_list else {}
     # assert or  metric_list[0].name == 'exp_auc'
     epoch_avg_attn, epoch_std_attn, epoch_label = torch.cat(epoch_avg_attn), torch.cat(epoch_std_attn), torch.cat(epoch_label)
+    if method_name in ['subgraphx', 'pgexplainer']:
+        save_attn = pd.DataFrame(multi_epoch_attn, columns=method_seeds + ['node_labels', 'graph_id'])
+        # indexes =
+        save_dir = log_dir / f"bseed_{backbone_seed}_{method_name}_attns.csv"
+        save_attn.to_csv(save_dir)
+
     epoch_dict = {'exp_auc_avg': roc_auc_score(epoch_label, epoch_avg_attn),
                   'exp_auc_std': roc_auc_score(epoch_label, 1-epoch_std_attn),
                   'all_spearman': sum(all_spear) / len(all_spear),
@@ -170,11 +184,10 @@ if __name__ == '__main__':
     model_dir = Path('log') / config_name / method_name
     # cuda_id = args.cuda
     # for method_seed in args.mseeds:
-    # backbone_seed = args.bseed
-    for backbone_seed in range(10):
+    for backbone_seed in args.bseed:
         epoch_dict = test_uncertainty(config, method_name, model_name, backbone_seed, args.mseeds, dataset_name, model_dir, device)
-        all_seeds_res += [epoch_dict]
-    df = pd.DataFrame(all_seeds_res, index=['_'.join([f'bseed{seed}', method_name]) for seed in range(10)])
+    all_seeds_res += [epoch_dict]
+    df = pd.DataFrame(all_seeds_res, index=['_'.join([f'bseed{bseed}', method_name]) for bseed in args.bseed])
     with open(f'result/egnn_synmol/uncertainty/{method_name}.csv', mode='a') as f:
         df.to_csv(f, lineterminator="\n", header=f.tell() == 0)
 

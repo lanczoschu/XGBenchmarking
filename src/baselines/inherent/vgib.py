@@ -51,7 +51,6 @@ class VGIB(BaseRandom):
         attn = attn_log_logits.sigmoid()
         # attn = F.softmax(attn_log_logits, dim=1)
         # edge_attn = self.node_attn_to_edge_attn(attn, data.edge_index) if att_type == 'node' else attn if att_type == 'edge' else None
-        #
 
         #this part is used to add noise
         # node_feature = emb

@@ -53,6 +53,7 @@ class GNNLRP(BaseRandom):
         res_weights = self.node_attn_to_edge_attn(node_weights, data.edge_index) if hasattr(data, 'edge_label') else node_weights
         # sparse_edge_mask = control_sparsity(edge_attn)
         # sparsity_masked_logits = self.clf(data, edge_attn=sparse_edge_mask)
+        res_weights = self.min_max_scalar(res_weights)
 
         return -1, {}, original_clf_logits, res_weights.sigmoid()
 

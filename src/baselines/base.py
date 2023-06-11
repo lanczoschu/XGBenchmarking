@@ -42,6 +42,10 @@ class BaseRandom(nn.Module):
         edge_attn = src_attn * dst_attn
         return edge_attn
 
+    @staticmethod
+    def min_max_scalar(attn):
+        return (attn - attn.min()) / (attn.max() - attn.min())
+
 
 class LabelPerturb(nn.Module):
 

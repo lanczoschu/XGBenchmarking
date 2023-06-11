@@ -22,6 +22,7 @@ class Grad(BaseRandom):
     def start_tracking(self):
         self.activations_and_grads = ActivationsAndGradients(self.clf, self.target_layers)
 
+
     def __del__(self):
         self.activations_and_grads.release()
 
@@ -78,6 +79,7 @@ class GradX(Grad):
 
         res_weights = self.node_attn_to_edge_attn(node_att, data.edge_index) if hasattr(data, 'edge_label') else node_att
         # res_weights = node_att
+        res_weights = self.min_max_scalar(res_weights)
 
         return -1, loss_dict, original_clf_logits, res_weights.reshape(-1)
 
@@ -107,7 +109,8 @@ class GradCAM(Grad):
 
         # res_weights = self.node_attn_to_edge_attn(node_att, data.edge_index) if x_level == "graph" else node_att
         res_weights = self.node_attn_to_edge_attn(node_att, data.edge_index) if hasattr(data,
-                                                                                        'edge_label') else node_att
+                                                                                    'edge_label') else node_att
+        res_weights = self.min_max_scalar(res_weights)
 
         return -1, loss_dict, original_clf_logits, res_weights.reshape(-1)
 
@@ -194,6 +197,8 @@ class InterGrad(Grad):
         node_imp = (node_grads - min(node_grads)) / (max(node_grads) - min(node_grads))
 
         res_weights = self.node_attn_to_edge_attn(node_imp, data.edge_index) if hasattr(data,'edge_label') else node_imp
+        res_weights = self.min_max_scalar(res_weights)
+
         return -1, {}, original_clf_logits, res_weights.reshape(-1)
 
 class BinaryClassifierOutputTarget:

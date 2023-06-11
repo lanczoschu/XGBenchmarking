@@ -1,6 +1,7 @@
 import yaml
 import json
 import argparse
+import uuid
 from tqdm import tqdm
 from pathlib import Path
 import torch
@@ -21,6 +22,7 @@ from torch_geometric.nn import knn_graph
 import numpy as np
 import pandas as pd
 import warnings
+from eval import control_sparsity
 from datetime import datetime
 import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
@@ -158,36 +160,65 @@ def visualize_a_graph(edge_index, edge_att, node_label, node_type, ax, coor=None
     else:
         nx.draw_networkx_edges(G, pos, width=1, edge_color='gray', arrows=False, alpha=0.1, ax=ax, connectionstyle='arc3,rad=0.4')
 
+def get_edges_from_smiles(smiles):
+    mol = Chem.MolFromSmiles(smiles.values[0])
 
+    if len(mol.GetBonds()) > 0:  # mol has bonds
+        edges_list = []
+        for bond in mol.GetBonds():
+            i = bond.GetBeginAtomIdx()
+            j = bond.GetEndAtomIdx()
+
+            # add edges in both directions
+            edges_list.append((i, j))
+            edges_list.append((j, i))
+        # data.edge_index: Graph connectivity in COO format with shape [2, num_edges]
+        edge_index = np.array(edges_list, dtype=np.int64).T
+    else:  # mol has no bonds
+        edge_index = np.empty((2, 0), dtype=np.int64)
+    return torch.tensor(edge_index)
 
 def eval_one_epoch(baseline, data_loader, epoch, phase, seed, signal_class, writer=None, eval_metric=None, metric_list=None):
-    pbar, avg_loss_dict = tqdm(data_loader), dict()
+    view_mode = 0
 
+    pbar, avg_loss_dict = tqdm(data_loader), dict()
     clf_ACC, clf_AUC = torchmetrics.Accuracy(task='binary'), torchmetrics.AUROC(task='binary')
-    mis_neg, still_pos, neg, pos, masked_perf_drop = 0, 0, 0, 0, 0
+    mis, neg, pos, masked_perf_drop = 0, 0, 0, 0
+    mol_df = pd.read_csv('../data/synmol/raw' + '/logic8_smiles.csv')
     for idx, data in enumerate(pbar):
         # data = negative_augmentation(data, data_config, phase, data_loader, idx, loader_len)
         loss_dict, clf_logits, attn = eval_one_sample(baseline, data.to(baseline.device), epoch)
         ex_labels, clf_labels, data = to_cpu(data.node_label), to_cpu(data.y), data.cpu()
-
         label, pred = int(data.y.item()), int(clf_logits.sigmoid() > 0.5)
         neg += 1 if label == 0 else 0
         pos += 1 if label == 1 else 0
-        if label == 0:
-            masked_perf_drop = eval_metric.collect_batch(ex_labels, attn, data, signal_class, 'geometric')
+        if label == 1:
+            pass
+        #     fig, ax = plt.subplots(figsize=(10, 8))
+        #     edge_index = get_edges_from_smiles(mol_df.iloc[data.mol_df_idx]['smiles'])
+        #     edge_attn = node_attn_to_edge_attn(data.node_label, edge_index)
+        #     visualize_a_graph(edge_index, edge_attn, data.node_label, data.x, ax, coor=None, norm=False,
+        #                       mol_type=None, nodesize=300)
+        #     plt.show()
+        #     place = 0
+        if label == view_mode:
             [metric.collect_batch(ex_labels, attn, data, signal_class, 'geometric') for metric in metric_list]
-            if masked_perf_drop == 1:  # and np.random.random() < 0.1:
-                mis_neg += 1
+            masked_perf_drop = eval_metric.collect_batch(ex_labels, attn, data, signal_class, 'geometric')
+            if masked_perf_drop == 1 - view_mode:  # still_pos (view_mode=1 and masked_perf_drop=0) or mis_neg
+                mis += 1
                 fig, ax = plt.subplots(figsize=(10, 8))
-                edge_index = knn_graph(data.pos, k=2, batch=data.batch, loop=False)
-                edge_attn = node_attn_to_edge_attn(attn, edge_index) if baseline.name != 'lri_gaussian' else None
-                visualize_a_graph(edge_index, edge_attn, data.node_label, data.x, ax, coor=None, norm=False, mol_type=None, nodesize=300)
+                sparse_attn = control_sparsity(attn, sparsity=eval_metric.sparsity)
+                edge_index = get_edges_from_smiles(mol_df.iloc[data.mol_df_idx]['smiles'])
+                # edge_index = knn_graph(data.pos, k=2, batch=data.batch, loop=False)
+                edge_attn = node_attn_to_edge_attn(sparse_attn, edge_index) if baseline.name != 'lri_gaussian' else None
+                visualize_a_graph(edge_index, 1 - edge_attn, data.node_label, data.x, ax, coor=None, norm=False, mol_type=None, nodesize=300)
                 # fig.tight_layout()
-                masked_pred = 1 - pred
-                plt.title(f'label: {label}, pred: {pred}, masked_pred: {masked_pred}')
-            # plt.show()
+                masked_pred = 1 - pred if masked_perf_drop == 1 else pred
+                plt.title(f'label: {label}, pred: {pred}, masked_pred: {masked_pred}, sparsity: {eval_metric.sparsity}')
+                # uid = uuid.uuid1()
+                plt.savefig(f'../../img/erm/' + str(data.mol_df_idx.item()) + '.png')
+                # plt.show()
         # print()
-
         eval_dict = {}
         eval_dict.update({'clf_acc': clf_ACC(clf_logits, clf_labels), 'clf_auc': clf_AUC(clf_logits, clf_labels)})
         # eval_dict.update({'mean_fid': mean([eval_dict[k] for k in eval_dict if 'fid' in k])})
@@ -196,12 +227,11 @@ def eval_one_epoch(baseline, data_loader, epoch, phase, seed, signal_class, writ
         pbar.set_description(desc)
         # compute the avg_loss for the epoch desc
         exec('for k, v in loss_dict.items():\n\tavg_loss_dict[k]=(avg_loss_dict.get(k, 0) * idx + v) / (idx + 1)')
-    print(f"mis_neg/neg/all: {mis_neg}/{neg}/{len(pbar)}")
+    # print(f"mis_neg/neg/all: {mis}/{neg}/{len(pbar)}")
     epoch_dict = {eval_metric.name: eval_metric.eval_epoch()}
     epoch_dict.update({metric.name: metric.eval_epoch() for metric in metric_list})
     epoch_dict.update({'clf_acc': clf_ACC.compute().item(), 'clf_auc': clf_AUC.compute().item()})
     # epoch_dict.update({'mean_fid': mean([epoch_dict[k] for k in epoch_dict if 'fid' in k])})
-
     # log_epoch(seed, epoch, phase, avg_loss_dict, epoch_dict, writer)
 
     return epoch_dict
@@ -236,7 +266,7 @@ def test(config, method_name, exp_method, model_name, backbone_seed, dataset_nam
         model = eval(name_mapping[exp_method])(clf, criterion, config[exp_method])
 
     # metric_list = [FidelEvaluation(backbone, i/10) for i in range(2, 9)]
-    main_metric = FidelEvaluation(backbone, 0.2)
+    main_metric = FidelEvaluation(backbone, 0.8)
     metric_list = [FidelEvaluation(backbone, i/10) for i in range(2, 9)]
     print('Use random explanation and fidelity w/ signal nodes to test the Model Sensitivity.')
     # test_set =
@@ -278,7 +308,7 @@ def get_avg_std_report(reports):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='EXP')
-    parser.add_argument('-d', '--dataset', type=str, help='dataset used', default='actstrack')
+    parser.add_argument('-d', '--dataset', type=str, help='dataset used', default='synmol')
     parser.add_argument('--clf_method', type=str, help='method used', default='erm', choices=inherent_models+['erm'])
     parser.add_argument('--exp_method', type=str, help='method used', default='label_perturb1', choices=['label_perturb1', 'label_perturb0'])
     parser.add_argument('-b', '--backbone', type=str, help='backbone used', default='egnn')

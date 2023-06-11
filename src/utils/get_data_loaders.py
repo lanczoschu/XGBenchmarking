@@ -9,8 +9,10 @@ def get_data_loaders(dataset_name, batch_size, data_config, dataset_seed):
 
     if 'actstrack' in dataset_name:
         def act_transform(data):
-            com_pos = data.pos.norm(dim=-1, keepdim=True)
-            edge_index = knn_graph(com_pos, k=5, batch=data.batch, loop=True)
+            # pos = data.pos / 2955.5000 * 100
+            norm_pos = data.pos.norm(dim=-1, keepdim=True)
+            pos = data.pos / norm_pos.clamp(min=1e-6)
+            edge_index = knn_graph(pos, k=5, batch=data.batch, loop=True)
             data.edge_index = edge_index
             return data
         tesla = '2T' if len(dataset_name.split('_')) == 1 else dataset_name.split('_')[-1]

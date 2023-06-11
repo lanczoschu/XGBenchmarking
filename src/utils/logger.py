@@ -50,8 +50,8 @@ def update_and_save_best_epoch_res(baseline, best, valid, test, epoch, model_dir
         test_res = {'test_' + k: v for k, v in test.items()}
         best.update({k: v for d in [init_dict, valid_res, test_res] for k, v in d.items()})
         # if model_dir is not None:
-        # if method_name in inherent_models:
-        save_checkpoint(baseline, model_dir, model_name=method_name, backbone_seed=backbone_seed, seed=seed)
+        if method_name in inherent_models + ['pgexplainer']:
+            save_checkpoint(baseline, model_dir, model_name=method_name, backbone_seed=backbone_seed, seed=seed)
 
         if writer is not None:
             for metric, value in best.items():
@@ -64,7 +64,7 @@ def update_and_save_best_epoch_res(baseline, best, valid, test, epoch, model_dir
         desc = ', '.join(['_'.join(more_readable(k.split('_'))) + f': {v:.3f}' for k, v in best.items() if k != 'best_epoch'])
         print('-' * 80), print(init_desc + desc), print('-' * 80)
 
-    return best
+    return best, better_val
 
 
 def load_checkpoint(model, model_dir, model_name, seed, map_location=None, backbone_seed=None, verbose=True):
@@ -78,9 +78,18 @@ def load_checkpoint(model, model_dir, model_name, seed, map_location=None, backb
         print('Load checkpoint in', load_dir) if verbose else None
         return True
 
-def save_checkpoint(model, model_dir, model_name, backbone_seed, seed):
+def save_checkpoint(model, model_dir, model_name, backbone_seed, seed, info=None):
     # assert info is not None
-    if model_name in inherent_models + ['erm']:
+    if model_name == 'erm':
+        assert backbone_seed == seed
+        if info is None:
+            save_dir = model_dir / (model_name + str(seed) + '.pt')
+            torch.save({'model_state_dict': model.state_dict()}, save_dir)
+        else:
+            save_dir = model_dir / (info['epochs'] + model_name + str(seed) + '.pt')
+            torch.save({'model_state_dict': model.state_dict()}, save_dir)
+
+    elif model_name in inherent_models:
         assert backbone_seed == seed
         save_dir = model_dir / (model_name + str(seed) + '.pt')
         torch.save({'model_state_dict': model.state_dict()}, save_dir)

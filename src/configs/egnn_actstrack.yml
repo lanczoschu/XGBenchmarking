@@ -36,28 +36,13 @@ optimizer:
   emb_lr: 1.0e-3
   emb_wd: 1.0e-5
 
-model:
-  egnn:
-    n_layers: 4
-    hidden_size: 64
-    dropout_p: 0.2
-    norm_type: batch
-    act_type: relu
-    pool: add
-  pointtrans:
-    n_layers: 4
-    hidden_size: 64
-    dropout_p: 0.2
-    norm_type: batch
-    act_type: relu
-    pool: add
-  dgcnn:
-    n_layers: 4
-    hidden_size: 64
-    dropout_p: 0.2
-    norm_type: batch
-    act_type: relu
-    pool: add
+egnn:
+  n_layers: 4
+  hidden_size: 64
+  dropout_p: 0.2
+  norm_type: batch
+  act_type: relu
+  pool: add
 
 erm:
   warmup: 300
@@ -68,11 +53,6 @@ lri_bern:
     epochs: 300
     warmup: 0
     final_r: 0.7
-    info_loss_coef: 1.0
-  pointtrans:
-    epochs: 200
-    warmup: 100
-    final_r: 0.5
     info_loss_coef: 1.0
   egnn:
     epochs: 300
@@ -147,20 +127,37 @@ vgib:
   norm_type: batch
   act_type: relu
 
+gnnlrp:
+  epochs: 1
+
+inter_grad:
+  epochs: 1
+  signal_class: 1
+
 gradcam:
   epochs: 1
-  warmup: 300
-  pred_lr: 0
-  pred_wd: 0
+  signal_class: 1
 
-gradgeo:
+gradx:
   epochs: 1
-  warmup: 300
-  gradgeo: true
-  pred_lr: 0
-  pred_wd: 0
+  signal_class: 1
 
-bernmask_p:
+subgraphx:
+  epochs: 1
+  sparsity_set: [0.3, 0.4, 0.5, 0.6, 0.7]
+  score_threshold: 0.1
+  high2low: false
+  subgraph_building_method: "split"
+  use_mcts: false
+  use_pruning: true
+
+pgmexplainer:
+  epochs: 1
+  pred_threshold: 0.3
+  perturb_mode: split
+  percentage: 20
+
+pgexplainer:
   dgcnn:
     size_loss_coef: 0.01
     mask_ent_loss_coef: 0.1
@@ -181,7 +178,7 @@ bernmask_p:
   norm_type: batch
   act_type: relu
 
-bernmask:
+gnnexplainer:
   dgcnn:
     size_loss_coef: 0.1
     mask_ent_loss_coef: 0.01
@@ -205,24 +202,3 @@ bernmask:
   norm_type: batch
   act_type: relu
 
-pointmask:
-  dgcnn:
-    t: 0.2
-    kl_loss_coef: 0.01
-  pointtrans:
-    t: 0.2
-    kl_loss_coef: 1.0
-  egnn:
-    t: 0.2
-    kl_loss_coef: 1.0
-
-  epochs: 300
-  warmup: 0
-  one_encoder: false
-  covar_dim: 2  # MLP output 2 dims for mu and sigma
-  pred_loss_coef: 1.0
-  pred_lr: 1.0e-3
-  pred_wd: 1.0e-5
-  dropout_p: 0.2
-  norm_type: batch
-  act_type: relu

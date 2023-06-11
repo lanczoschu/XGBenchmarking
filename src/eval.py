@@ -385,11 +385,6 @@ class FidelEvaluation(BaseEvaluation):
             scores = (origin_pred == clf_labels).float() - (masked_pred == clf_labels).float()
 
         self.perf.append(scores.reshape(-1))
-        # try:
-            # this is used for visualization
-            # scores.item() == 1
-        # except:
-        #     pass
         return scores.reshape(-1).mean().item()
 
     def eval_epoch(self):
@@ -398,6 +393,9 @@ class FidelEvaluation(BaseEvaluation):
             return -1
         else:
             perf = torch.cat(self.perf).cpu()
+
+        if self.type == 'auc':
+            auc_score = roc_auc_score()
         return perf.mean().item()
 
     def reset(self):
@@ -408,6 +406,167 @@ class FidelEvaluation(BaseEvaluation):
         self.test.append(test_res) if not test_res else None
 
         return self.valid, self.test
+
+
+class AucFidelity(BaseEvaluation):
+    def __init__(self, model, sparsity, symbol='+', instance='all'):
+        self.sparsity = sparsity
+        self.org_score = []
+        self.msk_score = []
+        self.clf_label = []
+        self.valid = []
+        self.test = []
+        self.type = 'auc'
+        self.symbol = symbol
+        self.name = self.type + '-fidelity' + symbol + '@' + str(sparsity) + '-' + instance
+        self.instance = instance
+        self.classifier = model
+        self.device = next(model.parameters()).device
+
+    def create_new_data(self, data, weights, weight_type='edge', signal_class=None, instance=None):
+        sum_ = 0
+        data_list = []
+        count = 0
+        pos_data_list = []
+        for graph in data.to_data_list():
+            if weight_type == 'node':
+                node_weights = weights[sum_:sum_ + graph.num_nodes]
+                sum_ += graph.num_nodes
+                if instance == 'pos' and graph.y.item() != signal_class:
+                    continue
+                if instance == 'neg' and graph.y.item() == signal_class:
+                    continue
+
+                node_weights = control_sparsity(node_weights, self.sparsity, self.symbol)
+                idx = node_weights.reshape(-1).nonzero().reshape(-1)
+                assert idx.numel()
+                edge_list = []
+                # print(node_weights)
+                for edge_pair in graph.edge_index.T:
+                    edge_list += [edge_pair] if edge_pair[0] in idx and edge_pair[1] in idx else []
+                if edge_list:
+                    edge_index = torch.vstack(edge_list).T
+                else:
+                    edge_index = torch.tensor([], dtype=graph.edge_index.dtype, device=graph.edge_index.device).reshape(
+                        2, -1)
+
+                if graph.edge_attr is not None:
+                    edge_attr_list = [
+                        graph.edge_attr[i] if (idx == edge_pair[0]).numel() and (idx == edge_pair[1]).numel()
+                        else None for i, edge_pair in enumerate(graph.edge_index.T)]
+                    edge_attr = torch.vstack(edge_attr_list)
+                else:
+                    edge_attr = None
+
+                x = graph.x[idx]
+                if graph.pos is not None:
+                    pos = graph.pos[idx]
+                else:
+                    pos = None
+
+                row = edge_index[0]
+                node_idx = row.new_full((max(idx) + 1,), -1)
+                node_idx[idx] = torch.arange(idx.size(0), device=idx.device)
+                edge_index = node_idx[edge_index]
+            else:
+                graph_weights = weights[sum_:sum_ + graph.num_edges]
+                sum_ += graph.num_edges
+                if instance == 'pos' and graph.y.item() != signal_class:
+                    continue
+                if instance == 'neg' and graph.y.item() == signal_class:
+                    continue
+
+                graph_weights = control_sparsity(graph_weights, self.sparsity, self.symbol)
+                idx = graph_weights.reshape(-1).nonzero().reshape(-1)
+                assert idx.numel()
+                x = graph.x
+                edge_index = graph.edge_index[:, idx]
+                edge_attr = graph.edge_attr[idx] if graph.edge_attr is not None else None
+
+                # node relabel
+                num_nodes = x.size(0)
+                sub_nodes = torch.unique(edge_index)
+
+                x = x[sub_nodes]
+
+                if graph.pos is not None:
+                    pos = graph.pos
+                    pos = pos[sub_nodes]
+                else:
+                    pos = None
+
+                row, col = edge_index
+                # remapping the nodes in the explanatory subgraph to new ids.
+                node_idx = row.new_full((num_nodes,), -1)
+                node_idx[sub_nodes] = torch.arange(sub_nodes.size(0), device=row.device)
+                edge_index = node_idx[edge_index]
+
+            data_list += [Data(x=x, y=graph.y, pos=pos, edge_index=edge_index, edge_attr=edge_attr)]
+            pos_data_list += [graph]
+        if "-fidelity" in self.name and count:
+            print(f'There is {count} graphs with no edges in this batch. (len:{len(data_list)})')
+        new_data = Batch.from_data_list(data_list)
+        pos_data = Batch.from_data_list(pos_data_list)
+        return pos_data, new_data
+
+    def collect_batch(self, x_labels, weights, data, signal_class, x_level):
+        # data.edge_index = self.classifier.get_emb(data)[1]
+        # print(data.edge_index is None)
+        weights = weights.reshape(-1, 1)
+        # pos_data, pos_new_data = self.get_pos_instances(data, weights, weight_type=weight_type)
+        if hasattr(data, "edge_label"):
+            weight_type = 'edge'
+        elif x_level == 'geometric':
+            weight_type = 'node'
+        else:
+            assert x_level == 'graph'
+            weights = node_attn_to_edge_attn(weights, data.edge_index)
+            weight_type = 'edge'
+        # weight_type = 'node' if weights.shape[0] != data.edge_index.shape[1] else 'edge'
+        # print(data.x.device, weights.device)
+        pos_data, pos_new_data = self.create_new_data(data, weights, weight_type=weight_type, signal_class=signal_class,
+                                                      instance=self.instance)
+
+        # if weights.shape[0] != data.edge_index.shape[1]:    # node_weights
+        #     weights = node_attn_to_edge_attn(weights, data.edge_index)
+        with torch.no_grad():
+            origin_logits = self.classifier(pos_data.to(self.device))
+            masked_logits = self.classifier(pos_new_data.to(self.device))
+
+        clf_labels = pos_data.y.clone()
+        origin_pred = origin_logits.sigmoid()
+        masked_pred = masked_logits.sigmoid()
+
+        self.clf_label.append(clf_labels)
+        self.org_score.append(origin_pred)
+        self.msk_score.append(masked_pred)
+
+        return -1
+
+    def eval_epoch(self):
+        # in the phas 'train', the train_res will be -1
+        if not self.clf_label:
+            raise AssertionError
+        else:
+            clf_labels = torch.cat(self.clf_label).cpu()
+            origin_pred = torch.cat(self.org_score).cpu()
+            masked_pred = torch.cat(self.msk_score).cpu()
+            org_auc = roc_auc_score(clf_labels, origin_pred)
+            msk_auc = roc_auc_score(clf_labels, masked_pred)
+        return org_auc - msk_auc
+
+    def reset(self):
+        self.clf_label = []
+        self.org_score = []
+        self.msk_score = []
+
+    def update_epoch(self, valid_res, test_res):
+        self.valid.append(valid_res)
+        self.test.append(test_res) if not test_res else None
+
+        return self.valid, self.test
+
+
 
 
 class TOPKEvaluation(BaseEvaluation):

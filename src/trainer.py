@@ -1,8 +1,9 @@
 import os
 pre_cuda_id = int(os.environ.get('CUDA_VISIBLE_DEVICES')) if os.environ.get('CUDA_VISIBLE_DEVICES') else None
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5'
 import yaml
 import json
+import pandas as pd
 import shutil
 import argparse
 from tqdm import tqdm
@@ -73,17 +74,26 @@ def train_one_batch(baseline, optimizer, data, epoch, phase):
     return loss_dict, to_cpu(org_clf_logits), to_cpu(node_attn)
 
 
-def run_one_epoch(baseline, optimizer, data_loader, epoch, phase, seed, signal_class, writer=None, metric_list=None):
+def run_one_epoch(baseline, optimizer, data_loader, epoch, phase, seed, signal_class, writer=None, metric_list=None, return_attn=False):
     use_tqdm = True
     run_one_batch = train_one_batch if optimizer else eval_one_batch
     pbar, avg_loss_dict = tqdm(data_loader) if use_tqdm else data_loader, dict()
     [eval_metric.reset() for eval_metric in metric_list] if phase in ['valid', 'test'] else None
 
     clf_ACC, clf_AUC = torchmetrics.Accuracy(task='binary'), torchmetrics.AUROC(task='binary')
+    save_epoch_attn = []
     for idx, data in enumerate(pbar):
         # data = negative_augmentation(data, data_config, phase, data_loader, idx, loader_len)
         loss_dict, clf_logits, attn = run_one_batch(baseline, optimizer, data.to(baseline.device), epoch, phase)
         ex_labels, clf_labels, data = to_cpu(data.node_label), to_cpu(data.y), data.cpu()
+
+        # prepare to save attn
+        if return_attn:
+            graph_labels = data.y[data.batch]
+            batch_idx = torch.full_like(graph_labels, idx)
+            graph_idx = data.batch.unsqueeze(-1)
+            save_attn = torch.cat([attn.unsqueeze(-1), ex_labels.unsqueeze(-1), graph_labels, batch_idx, graph_idx], dim=1)
+            save_epoch_attn.append(save_attn)
 
         eval_dict = {metric.name: metric.collect_batch(ex_labels, attn, data, signal_class, 'geometric')
                      for metric in metric_list} if phase in ['valid', 'test'] else {}
@@ -102,10 +112,15 @@ def run_one_epoch(baseline, optimizer, data_loader, epoch, phase, seed, signal_c
     epoch_dict.update({'mean_fid': mean(fid_score)}) if phase in ['valid', 'test'] and fid_score else {}
 
     log_epoch(seed, epoch, phase, avg_loss_dict, epoch_dict, writer)
-    return epoch_dict
+
+    if return_attn:
+        save_epoch_attn = torch.cat(save_epoch_attn, dim=0)
+        return epoch_dict, save_epoch_attn
+    else:
+        return epoch_dict
 
 
-def train(config, method_name, model_name, backbone_seed, seed, dataset_name, parent_dir, device, main_metric, quick=False):
+def train(config, method_name, model_name, backbone_seed, seed, dataset_name, parent_dir, device, main_metric, quick=False, save=False):
     # writer = SummaryWriter(log_dir) if log_dir is not None else None
     writer = None
     model_dir, log_dir = (parent_dir / method_name, ) * 2 if method_name in inherent_models \
@@ -138,6 +153,9 @@ def train(config, method_name, model_name, backbone_seed, seed, dataset_name, pa
         baseline = constructor(clf, extractor, criterion, config[method_name])
         for epoch in range(1, warmup+1):
             run_one_epoch(baseline, optimizer, loaders['train'], epoch, 'warm', seed, signal_class, writer)
+            if save:
+                save_checkpoint(baseline.clf, model_dir, model_name='erm', backbone_seed=backbone_seed,
+                                seed=backbone_seed)
         metric_list = [AUCEvaluation()]
     elif method_name in post_hoc_attribution + post_hoc_explainers:
         baseline = constructor(clf, criterion, config[method_name]) if method_name != 'pgexplainer' else PGExplainer(clf, extractor, criterion, config['pgexplainer'])
@@ -163,24 +181,29 @@ def train(config, method_name, model_name, backbone_seed, seed, dataset_name, pa
     metric_names = [a + b for a, b in product(['valid_', 'test_'], [i.name for i in metric_list]+['clf_acc', 'clf_auc', 'mean_fid'])]
     # metric_names = [j+i.name for i in metric_list for j in ['valid_', 'test_']]
     metric_dict = {}.fromkeys(metric_names, 0)
+    best_attn = None
     optimizer = get_optimizer(clf, extractor, config['optimizer'], method_name, warmup=False)
     for epoch in range(1, epochs+1):
         if method_name in inherent_models + ['pgexplainer']:
             run_one_epoch(baseline, optimizer, loaders['train'], epoch, 'train', seed, signal_class, writer, metric_list)
-        if method_name == 'subgraphx' or method_name == 'test':
-            # to save time, subgraphx is super time-consuming
-            test_dict = run_one_epoch(baseline, None, loaders['test'], epoch, 'test', seed, signal_class,  writer, metric_list)
-            valid_dict = test_dict
-        else:
             valid_dict = run_one_epoch(baseline, None, loaders['valid'], epoch, 'valid', seed, signal_class, writer, metric_list)
-            test_dict = run_one_epoch(baseline, None, loaders['test'], epoch, 'test', seed, signal_class,  writer, metric_list)
+            test_dict, epoch_attn = run_one_epoch(baseline, None, loaders['test'], epoch, 'test', seed,
+                                                  signal_class, writer, metric_list, return_attn=True)
+        else:
+            test_dict, epoch_attn = run_one_epoch(baseline, None, loaders['test'], epoch, 'test', seed,
+                                                  signal_class,  writer, metric_list, return_attn=True)
+            valid_dict = test_dict # other methods don't need validation to select epochs
 
         # print(metric_dict)
-        metric_dict = update_and_save_best_epoch_res(baseline, metric_dict, valid_dict, test_dict, epoch, log_dir, backbone_seed, seed, writer, method_name, main_metric)
+        metric_dict, new_best = update_and_save_best_epoch_res(baseline, metric_dict, valid_dict, test_dict, epoch, log_dir, backbone_seed, seed, writer, method_name, main_metric)
+        best_attn = epoch_attn if new_best else best_attn
         metric_dict.update({'default': metric_dict[f'valid_{main_metric}']})
         nni.report_intermediate_result(metric_dict)
 
-    return metric_dict
+    meta_index = 'attn' if method_name in post_hoc_attribution + inherent_models else seed
+    indexes = [meta_index, 'node_labels', 'graph_labels', 'batch_idx', 'graph_idx']
+
+    return metric_dict, (best_attn, indexes)
 
 
 def run_one_seed(args, optimized_params):
@@ -199,17 +222,18 @@ def run_one_seed(args, optimized_params):
         config[method_name].update(optimized_params)
     print('=' * 80)
     print(f'Config for {method_name}: ', json.dumps(config[method_name], indent=4))
-
-    cuda_ = f'cuda:{pre_cuda_id}' if cuda_id == 99 else f'cuda:{cuda_id}' if cuda_id >= 0 else 'cpu'
+    # :{pre_cuda_id}
+    cuda_ = f'cuda' if cuda_id == 99 else f'cuda:{cuda_id}' if cuda_id >= 0 else 'cpu'
     device = torch.device(cuda_)
     # log_dir = None
     # if config['logging']['tensorboard'] or method_name in ['gradcam', 'gradgeo', 'bernmask_p', 'bernmask']:
     main_dir = Path('log') / config_name
-    # the directory is like egnn_actstrack / bseed0 / lri_bern
     main_dir.mkdir(parents=True, exist_ok=True)
         # shutil.copy(config_path, log_dir / config_path.name)
-    report_dict = train(config, method_name, model_name, backbone_seed, method_seed, dataset_name, main_dir, device, main_metric, quick=args.quick)
-    return report_dict
+    report_dict, (best_attn, indexes) = train(config, method_name, model_name, backbone_seed, method_seed, dataset_name, main_dir, device, main_metric, quick=args.quick, save=args.save)
+    attn_df = pd.DataFrame(best_attn, columns=indexes)
+
+    return report_dict, attn_df
 
 
 def main(args):
@@ -217,7 +241,8 @@ def main(args):
         torch.cuda.set_per_process_memory_fraction(args.gpu_ratio)
 
     params = nni.get_next_parameter()
-    report_dict = run_one_seed(args, params)
+    report_dict, attn_df = run_one_seed(args, params)
+
     print(json.dumps(report_dict, indent=4))
     # nni_report = dict(report_dict, **{'default': report_dict[f'valid_{main_metric}']})
     nni.report_final_result(report_dict)

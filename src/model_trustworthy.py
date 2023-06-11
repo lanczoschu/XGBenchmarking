@@ -19,6 +19,7 @@ import pandas as pd
 import warnings
 from datetime import datetime
 from scipy.stats import spearmanr as SP
+from sklearn.metrics import accuracy_score
 warnings.filterwarnings("ignore")
 
 
@@ -38,7 +39,7 @@ def eval_one_batch(baseline, data, epoch):
         return loss_dict, to_cpu(infer_clf_logits), to_cpu(node_attn)
 
 
-def data_insights(config, method_name, model_name, backbone_seed, dataset_name, log_dir, device):
+def model_trustworthy(config, method_name, model_name, backbone_seed, dataset_name, log_dir, device):
     set_seed(backbone_seed)
     print('The logging directory is', log_dir), print('=' * 80)
 
@@ -131,18 +132,26 @@ def save_multi_bseeds(multi_methods_res, method_name, exp_method, seeds):
     return df
 
 
-def save_multi_result(method_res, all_methods, config_name):
+def save_multi_result(method_res, all_methods, config_name, metric_str, exp_metric_str):
 
     df = pd.DataFrame(method_res, index=all_methods)
 
-    day_dir = Path('result') / config_name / 'data_insights'
+    day_dir = Path('result') / config_name / 'model_trustworthy' / metric_str
     day_dir.mkdir(parents=True, exist_ok=True)
-    csv_dir = day_dir / ('_'.join(all_methods) + '_insights.csv')
+    csv_dir = day_dir / ('_'.join([exp_metric_str] + all_methods) + '_trust.csv')
     with open(csv_dir, mode='w') as f:
         df.to_csv(f, lineterminator="\n", header=f.tell() == 0)
     now_df = pd.read_csv(csv_dir, index_col=0)
     return now_df
 
+
+def average_accuracy(label, attn):
+    zero_one = np.linspace(0, 1, num=50)
+    scores = np.array([])
+    for treshold in zero_one:
+        pred = (attn > treshold).float()
+        scores = np.append(scores, accuracy_score(label, pred))
+    return scores.mean()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='EXP')
@@ -151,24 +160,45 @@ if __name__ == '__main__':
     parser.add_argument('-b', '--backbone', type=str, help='backbone used', default='egnn')
     parser.add_argument('--cuda', type=int, help='cuda device id, -1 for cpu', default=-1)
     parser.add_argument('--note', type=str, help='note in log name', default='')
-    parser.add_argument('--seeds', type=int, nargs="+", help='random seed for data insights pipeline', default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    parser.add_argument('--seeds', type=int, nargs="+", help='random seed for exp methods pipeline', default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
     # parser.add_argument('--mseed', type=int, help='random seed for explainer', default=0)
+    parser.add_argument('--bseeds', type=int, nargs="+", help='random seed to establish a series of classifiers', default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    parser.add_argument('--metric', type=str, choices=['acc_fid_pos', 'auc_fid_all'], default='acc_fid_pos')
+    parser.add_argument('--exp_metric', type=str, choices=['roc_auc', 'avg_acc'], default='avg_acc')
+
     parser.add_argument('--use_csv', action="store_true")
+    parser.add_argument('--skip_py', action="store_true")
 
     args = parser.parse_args()
     # sub_metric = 'avg_loss'
     print(args)
-
     dataset_name, model_name, cuda_id, note = args.dataset, args.backbone, args.cuda, args.note
+
+    if not args.skip_py:
+        import os
+        os.system(f"python test_sensitivity.py -d {dataset_name} -b {model_name} --metric {args.metric} --cuda {cuda_id} --exp_method label_perturb1")
+        os.system(f"python test_sensitivity.py -d {dataset_name} -b {model_name} --metric {args.metric} --cuda {cuda_id} --exp_method label_perturb0")
+    # The result is stored in the result/egnn_synmol/sensitivity/label_perturb1_erm.csv
     config_name = '_'.join([model_name, dataset_name])
+    path1 = Path('result') / config_name / 'sensitivity' / args.metric / datetime.now().strftime("%m_%d") / 'label_perturb1_erm.csv'
+    path0 = Path('result') / config_name / 'sensitivity' / args.metric / datetime.now().strftime("%m_%d") / 'label_perturb0_erm.csv'
+    perturb1_score = pd.read_csv(path1, index_col=0)
+    perturb0_score = pd.read_csv(path0, index_col=0)
+    rows = [i for i in perturb1_score.index if 'avg' in i]
+    erm_score = (perturb1_score['mean_fid'] - perturb0_score['mean_fid'])[rows]
+    erm_dict = {k.replace('erm', 'bseed').replace('_avg', ''): v for k, v in erm_score.to_dict().items()}
+    print(erm_dict)
+
     device = torch.device(f'cuda:{cuda_id}' if cuda_id >= 0 and torch.cuda.is_available() else 'cpu')
     # sub_dataset_name = '_' + dataset_name.split('_')[1] if len(dataset_name.split('_')) > 1 else ''
     config_path = Path('./configs') / f'{config_name}.yml'
     config = yaml.safe_load((config_path).open('r'))
-    all_methods = post_hoc_attribution + ['pgexplainer', 'pgmexplainer', 'lri_gaussian', 'lri_bern', 'vgib'] if args.method == 'all' else [args.method]
+    all_methods = post_hoc_attribution + ['pgexplainer', 'pgmexplainer'] if args.method == 'all' else [args.method]
     method_res = []
+    metric_func = average_accuracy if args.exp_metric == 'avg_acc' else roc_auc_score if args.exp_metric == 'roc_auc' else None
     for method_name in all_methods:
-        method_dict = {'single_attn_auc': []}
+        method_dict = {}
+        method_seeds = [0] if method_name in post_hoc_attribution else args.seeds
         if config[method_name].get(model_name, False):
             config[method_name].update(config[method_name][model_name])
         print('=' * 80)
@@ -177,47 +207,32 @@ if __name__ == '__main__':
         model_dir = Path('log') / config_name / method_name
         multi_attn, multi_sig_attn, multi_bkg_attn = None, None, None
 
-        for all_seed in args.seeds:
-            if not args.use_csv:
-                epoch_attn, epoch_label, epoch_sig_attn, epoch_bkg_attn = \
-                    data_insights(config, method_name, model_name, all_seed, dataset_name, model_dir, device)
-                method_dict['single_attn_auc'].append(roc_auc_score(epoch_label, epoch_attn))
-                multi_attn = epoch_attn.unsqueeze(1) if multi_attn is None else torch.cat([multi_attn, epoch_attn.unsqueeze(1)], dim=1)
-                multi_sig_attn = epoch_sig_attn.unsqueeze(1) if multi_sig_attn is None else torch.cat([multi_sig_attn, epoch_sig_attn.unsqueeze(1)], dim=1)
-                multi_bkg_attn = epoch_bkg_attn.unsqueeze(1) if multi_bkg_attn is None else torch.cat([multi_bkg_attn, epoch_bkg_attn.unsqueeze(1)], dim=1)
-                # sig_index, bkg_index = torch.where(data.node_label == 1), torch.where(data.node_label == 0)
-
-            else:  # we directly load attns from csv file
-                mseed = [0] if method_name in post_hoc_attribution else [all_seed] if method_name in inherent_models else \
-                    list(range(10))
-                save_dir = model_dir / f"bs{all_seed}_ms{mseed}_attns.csv"
-                seed_df = pd.read_csv(save_dir, index_col=0)
-                epoch_label = torch.tensor(seed_df['node_labels'])
-                if 'attn' in seed_df:  # this means the method has no need to vary seeds for fixed backbone_seed
-                    seed_attn = torch.tensor(seed_df['attn']).unsqueeze(1)
-                else:  # for post-hoc explainers, there are many seed res and only use the same seed with backbone_seed
-                    seed_attn = torch.tensor(seed_df[str(all_seed)]).unsqueeze(1)
-                method_dict['single_attn_auc'].append(roc_auc_score(epoch_label, seed_attn))
-                seed_sig_attn = torch.tensor(seed_attn[seed_df['node_labels'] == 1]).unsqueeze(1)
-                seed_bkg_attn = torch.tensor(seed_attn[seed_df['node_labels'] == 0]).unsqueeze(1)
-                multi_attn = seed_attn if multi_attn is None else torch.cat([multi_attn, seed_attn], dim=1)
-                multi_sig_attn = seed_sig_attn if multi_sig_attn is None else torch.cat([multi_sig_attn, seed_sig_attn], dim=1)
-                multi_bkg_attn = seed_bkg_attn if multi_bkg_attn is None else torch.cat([multi_bkg_attn, seed_bkg_attn], dim=1)
-
-        avg_attn, std_attn = torch.mean(multi_attn, dim=1), torch.std(multi_attn, dim=1)
-        avg_sig_attn, std_sig_attn = torch.mean(multi_sig_attn, dim=1), torch.std(multi_sig_attn, dim=1)
-        avg_bkg_attn, std_bkg_attn = torch.mean(multi_bkg_attn, dim=1), torch.std(multi_bkg_attn, dim=1)
-
-        exp_auc_avg, exp_auc_std = roc_auc_score(epoch_label, avg_attn), roc_auc_score(epoch_label, 1 - std_attn)
-        all_spearman, sig_spear, bkg_spear = SP(avg_attn, std_attn)[0], SP(avg_sig_attn, std_sig_attn)[0], SP(avg_bkg_attn, std_bkg_attn)[0]
-        method_dict.update({'avg_attn_auc': roc_auc_score(epoch_label, avg_attn), 'std_attn_auc': roc_auc_score(epoch_label, 1-std_attn),
-                        'all_attn_avg': avg_attn.mean().item(), 'sig_attn_avg': avg_sig_attn.mean().item(), 'bkg_attn_avg': avg_bkg_attn.mean().item(),
-                       'all_attn_std': std_attn.mean().item(), 'sig_attn_std': std_sig_attn.mean().item(), 'bkg_attn_std': std_bkg_attn.mean().item()})
-        method_dict.update({'single_attn_auc_avg': np.mean(method_dict['single_attn_auc']),
-                            'single_attn_auc_std': np.var(method_dict['single_attn_auc'])})
+        for one_seed in args.bseeds:
+            # we directly load attns from csv file
+            all_seeds = [0] if method_name in post_hoc_attribution else args.seeds
+            assert args.use_csv
+            save_dir = model_dir / f"bs{one_seed}_ms{all_seeds}_attns.csv"
+            seed_df = pd.read_csv(save_dir, index_col=0)
+            seed_df = seed_df[seed_df['graph_labels'] == 1]
+            epoch_label = torch.tensor(seed_df['node_labels'].values)
+            if 'attn' in seed_df:  # this means the method has no need to vary seeds for fixed backbone_seed
+                avg_attn = torch.tensor(seed_df['attn'].values).unsqueeze(1)
+            else:  # for post-hoc explainers, there are many seed res and only use the same seed with backbone_seed
+                avg_attn = torch.tensor(seed_df[[str(seed) for seed in all_seeds]].values).mean(1, keepdim=True)
+            method_dict[f'bseed_{one_seed}'] = metric_func(epoch_label, avg_attn)
         method_res += [method_dict]
         print(json.dumps(method_dict, indent=4))
 
-    save_multi_result(method_res, all_methods, config_name)
+    df = save_multi_result([erm_dict] + method_res, ['erm_score'] + all_methods, config_name, args.metric, args.exp_metric)
+    sp_corr = df.T.corr(method="spearman")
+    pr_corr = df.T.corr(method="pearson")
+    kd_corr = df.T.corr(method='kendall')
+    # print(f"Models' Score Func: {args.metric} \n"
+    print(f"Score Func: {args.exp_metric}")
+    print('spearman: \n', sp_corr)
+    print('pearson: \n', pr_corr)
+    print('kendall: \n', kd_corr)
+    path = Path('result') / config_name / 'model_trustworthy' / f'{args.metric}-{args.exp_metric}.csv'
+    sp_corr.to_csv(path)
 
 

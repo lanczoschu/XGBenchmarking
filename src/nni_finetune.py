@@ -4,7 +4,7 @@ from nni.experiment import Experiment, ExperimentConfig, AlgorithmConfig, LocalC
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Tune SAT')
+    parser = argparse.ArgumentParser(description='Tuning')
     parser.add_argument('--name', type=str, required=True, help='name of the experiment')
     parser.add_argument('-d', '--dataset', type=str, help='dataset used', required=True)
     parser.add_argument('-m', '--method', type=str, help='method used', required=True)
@@ -12,7 +12,7 @@ def main():
     args = parser.parse_args()
 
 
-    if args.method == 'gsat':
+    if args.method == 'lri_bern':
         search_space = {
             'epochs': {'_type': 'choice', '_value': [50]},
             'info_loss_coef': {'_type': 'choice', '_value': [0.1, 1.0, 0.01, 10]},
@@ -28,18 +28,19 @@ def main():
 
     elif args.method == 'ciga':
         search_space = {
+            # 'warmup': {'_type': 'choice', '_value': [0, 100, 200]},
             'contrast_loss_coef': {'_type': 'choice', '_value': [0.1, 1, 10]},
             'hinge_loss_coef': {'_type': 'choice', '_value': [0.01, 0.1, 1]},
-            'causal_ratio': {'_type': 'choice', '_value': [0.2, 0.3, 0.4]},
+            'causal_ratio': {'_type': 'choice', '_value': [0.6, 0.7, 0.8]},
         }
 
 
-    elif args.method == 'psat':
+    elif args.method == 'lri_gaussian':
         pos_coef_options = {
-            'actstrack': [200.0, 300.0], # [100.0, 200.0, 300.0]  # 1 is ~20%, 10%, 5% percentiles
-            'synbind': [10.0, 15.0], # [5.0, 10.0, 15.0]  # 1 is ~10%, 7%, 5% percentiles
-            'tau3mu': [7, 11], # [3, 7, 11]  # 1 is ~10%, 5%, 3% percentiles
-            'plbind': [0.9, 1.2] # [0.6, 0.9, 1.2]  # 1 is ~10%, 6.5%, 5% percentiles
+            'actstrack': [200.0, 300.0],  # [100.0, 200.0, 300.0]  # 1 is ~20%, 10%, 5% percentiles
+            'synbind': [10.0, 15.0],  # [5.0, 10.0, 15.0]  # 1 is ~10%, 7%, 5% percentiles
+            'tau3mu': [7, 11],  # [3, 7, 11]  # 1 is ~10%, 5%, 3% percentiles
+            'plbind': [0.9, 1.2]  # [0.6, 0.9, 1.2]  # 1 is ~10%, 6.5%, 5% percentiles
         }
         kr_options = {
             'actstrack': [10],  # [5, 10]
@@ -127,7 +128,7 @@ def main():
     #             'gradcam/way_to_sum_pos': {'_type': 'choice', '_value': ['norm']},
     #         }
 
-    trial_per_gpu = 2
+    trial_per_gpu = 3
     gpu_ratio = 1 / trial_per_gpu
     config = ExperimentConfig(
         debug=True,
@@ -143,16 +144,16 @@ def main():
         tuner=AlgorithmConfig(name='GridSearch', class_args={"optimize_mode": 'maximize'}),
         # experiment.config.tuner.name = 'SMAC'
         # experiment.config.max_trial_number = 10000
-        training_service=LocalConfig(use_active_gpu=True, max_trial_number_per_gpu=trial_per_gpu, gpu_indices=[0, 1, 2, 3, 4, 5])
+        training_service=LocalConfig(use_active_gpu=True, max_trial_number_per_gpu=trial_per_gpu, gpu_indices=[0, 1, 2])
         # training_service=RemoteConfig(machine_list=[RemoteMachineConfig(use_active_gpu=True, max_trial_number_per_gpu=\
         # trial_per_gpu, gpu_indices=[0, 1, 2, 3, 4], host='130.207.232.51', user='jzhu617',password='024convdreamStf') ])
         )
 
-
     experiment = Experiment(config)
-    experiment.run(8082)
+    experiment.run(8083)
     input('Press enter to quit')
     experiment.stop()
+    # experiment.view()
 
 
 if __name__ == '__main__':

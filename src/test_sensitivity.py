@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from eval import FidelEvaluation, AUCEvaluation
+from eval import FidelEvaluation, AUCEvaluation, AucFidelity
 from get_model import Model
 from baselines import LabelPerturb, VGIB, LRIBern, LRIGaussian, CIGA
 from utils import to_cpu, log_epoch, get_data_loaders, set_seed, load_checkpoint, ExtractorMLP, get_optimizer
@@ -45,7 +45,7 @@ def eval_one_epoch(baseline, data_loader, epoch, phase, seed, signal_class, writ
         eval_dict = {metric.name: metric.collect_batch(ex_labels, attn, data, signal_class, 'geometric')
                      for metric in metric_list}
         eval_dict.update({'clf_acc': clf_ACC(clf_logits, clf_labels), 'clf_auc': clf_AUC(clf_logits, clf_labels)})
-        fidel_list = [eval_dict[k] for k in eval_dict if 'fid' in k and 'all' in k]
+        fidel_list = [eval_dict[k] for k in eval_dict if 'fid' in k]
         eval_dict.update({'mean_fid': mean(fidel_list) if fidel_list else 0})
 
         desc = log_epoch(seed, epoch, phase, loss_dict, eval_dict, phase_info='dataset')
@@ -55,14 +55,14 @@ def eval_one_epoch(baseline, data_loader, epoch, phase, seed, signal_class, writ
 
     epoch_dict = {eval_metric.name: eval_metric.eval_epoch() for eval_metric in metric_list} if metric_list else {}
     epoch_dict.update({'clf_acc': clf_ACC.compute().item(), 'clf_auc': clf_AUC.compute().item()})
-    epoch_fidel = [epoch_dict[k] for k in epoch_dict if 'fid' and 'all' in k]
+    epoch_fidel = [epoch_dict[k] for k in epoch_dict if 'fid' in k]
     epoch_dict.update({'mean_fid': mean(epoch_fidel) if epoch_fidel else 0})
 
     # log_epoch(seed, epoch, phase, avg_loss_dict, epoch_dict, writer)
 
     return epoch_dict
 
-def test(config, method_name, exp_method, model_name, backbone_seed, dataset_name, log_dir, device):
+def test(config, method_name, exp_method, model_name, backbone_seed, method_seed, dataset_name, log_dir, device, metric_str):
     set_seed(backbone_seed)
     writer = None
     print('The logging directory is', log_dir), print('=' * 80)
@@ -82,7 +82,6 @@ def test(config, method_name, exp_method, model_name, backbone_seed, dataset_nam
     criterion = F.binary_cross_entropy_with_logits
 
     # establish the model and the metrics
-
     backbone = eval(name_mapping[method_name])(clf, extractor, criterion, config[method_name]) \
         if method_name in inherent_models else clf
     assert load_checkpoint(backbone, log_dir, model_name=method_name, seed=backbone_seed, map_location=torch.device('cpu') if not torch.cuda.is_available() else None)
@@ -92,12 +91,15 @@ def test(config, method_name, exp_method, model_name, backbone_seed, dataset_nam
     else:
         model = eval(name_mapping[exp_method])(clf, criterion, config[exp_method])
 
-    # metric_list = []
+
     # metric_list = [AUCEvaluation()] + [FidelEvaluation(backbone, i/10) for i in range(2, 9)] + \
     #  [FidelEvaluation(backbone, i/10, instance='pos') for i in range(2, 9)] + \
-    metric_list = [FidelEvaluation(backbone, 0.5*i/10 + 0.8, instance='neg') for i in reversed(range(5))]
-    print('Use random explanation and fidelity w/ signal nodes to test the Model Sensitivity.')
 
+    metric_list = [FidelEvaluation(backbone, i/10, instance='pos') for i in reversed(range(2, 9))] if metric_str == 'acc_fid_pos' \
+        else [AucFidelity(backbone, i/10, instance='all') for i in reversed(range(2, 9))] if metric_str == 'auc_fid_all' else None
+
+    # print('Use random explanation and fidelity w/ signal nodes to test the Model Sensitivity.')
+    set_seed(method_seed)
     # metric_names = [i.name for i in metric_list] + ['clf_acc', 'clf_auc']
     # train_dict = eval_one_epoch(model, loaders['train'], 1, 'train', backbone_seed, signal_class, writer, metric_list)
     # valid_dict = eval_one_epoch(model, loaders['valid'], 1, 'valid', backbone_seed, signal_class, writer, metric_list)
@@ -105,16 +107,16 @@ def test(config, method_name, exp_method, model_name, backbone_seed, dataset_nam
 
     return {}, {}, test_dict
 
-def save_multi_bseeds(multi_methods_res, method_name, exp_method, seeds):
-    seeds += ['avg', 'std']
-    indexes = [method_name+'_'+str(seed) for seed in seeds]
+def save_multi_bseeds(multi_methods_res, method_name, exp_method, seeds, metric_str, exp_metric_str):
+    # save_seeds = seeds +
+    indexes = ['_'.join([method_name, str(seed), item]) for seed in seeds  for item in ['avg', 'std']]
     # from itertools import product
     # indexes = ['_'.join(item) for item in product(methods, seeds)]
     df = pd.DataFrame(multi_methods_res, index=indexes)
 
-    day_dir = Path('result') / config_name / 'sensitivity' / datetime.now().strftime("%m_%d")
+    day_dir = Path('result') / config_name / 'sensitivity' / metric_str / datetime.now().strftime("%m_%d")
     day_dir.mkdir(parents=True, exist_ok=True)
-    csv_dir = day_dir / ('_'.join([exp_method, method_name, 'sensitivity.csv']))
+    csv_dir = day_dir / ('_'.join([exp_method, method_name]) + '.csv')
     with open(csv_dir, mode='w') as f:
         df.to_csv(f, lineterminator="\n", header=f.tell() == 0)
     return df
@@ -139,13 +141,15 @@ if __name__ == '__main__':
     parser.add_argument('--cuda', type=int, help='cuda device id, -1 for cpu', default=-1)
     parser.add_argument('--note', type=str, help='note in log name', default='')
     parser.add_argument('--bseeds', type=int, nargs="+", help='random seed for training backbone', default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
-    # parser.add_argument('--mseed', type=int, help='random seed for explainer', default=0)
+    parser.add_argument('--mseeds', type=int, nargs="+", help='random seed for explainer', default=list(range(10)))
+    parser.add_argument('--metric', type=str, choices=['acc_fid_pos', 'auc_fid_all'], default='acc_fid_pos')
 
     args = parser.parse_args()
     # sub_metric = 'avg_loss'
     print(args)
 
     dataset_name, method_name, model_name, cuda_id, note = args.dataset, args.clf_method, args.backbone, args.cuda, args.note
+
     exp_method = args.exp_method
     config_name = '_'.join([model_name, dataset_name])
     # sub_dataset_name = '_' + dataset_name.split('_')[1] if len(dataset_name.split('_')) > 1 else ''
@@ -156,22 +160,25 @@ if __name__ == '__main__':
 
     print('=' * 80)
     print(f'Config for {method_name}: ', json.dumps(config[method_name], indent=4))
-
-
-
     # the directory is like egnn_actstrack / bseed0 / lri_bern
-    multi_seeds_res = []
+
+    model_dir = Path('log') / config_name / method_name
+    multi_bseeds_res = []
     for backbone_seed in args.bseeds:
-        cuda_id = backbone_seed % 5
+        mseeds_res = []
+        # cuda_id = backbone_seed % 5
+        cuda_id = args.cuda
         device = torch.device(f'cuda:{cuda_id}' if cuda_id >= 0 and torch.cuda.is_available() else 'cpu')
-        model_dir = Path('log') / config_name / method_name
-        train_report, valid_report, test_report = test(config, method_name, exp_method, model_name, backbone_seed, dataset_name, model_dir, device)
-        multi_seeds_res += [test_report]
-        # print('Train Dataset Result: ', json.dumps(train_report, indent=4))
-        # print('Valid Dataset Result: ', json.dumps(valid_report, indent=4))
-        print('Test Dataset Result: ', json.dumps(test_report, indent=4))
-    avg_report, std_report, avg_std_report = get_avg_std_report(multi_seeds_res)
-    multi_seeds_res += [avg_report, std_report]
-    print(json.dumps(avg_std_report, indent=4))
-    save_multi_bseeds(multi_seeds_res, method_name, exp_method, args.bseeds)
+        for method_seed in args.mseeds:
+            # method_seed = int(method_seed)
+            # print('int or str:', type(method_seed))
+            train_report, valid_report, test_report = test(config, method_name, exp_method, model_name, backbone_seed, method_seed, dataset_name, model_dir, device, metric_str=args.metric)
+            mseeds_res += [test_report]
+            # print('Train Dataset Result: ', json.dumps(train_report, indent=4))
+            # print('Valid Dataset Result: ', json.dumps(valid_report, indent=4))
+            # print('Test Dataset Result: ', json.dumps(test_report, indent=4))
+        avg_report, std_report, avg_std_report = get_avg_std_report(mseeds_res)
+        multi_bseeds_res += [avg_report, std_report]
+        print(json.dumps(avg_std_report, indent=4))
+    save_multi_bseeds(multi_bseeds_res, method_name, exp_method, args.bseeds, args.metric, args.exp_metric)
 

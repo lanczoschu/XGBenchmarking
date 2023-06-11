@@ -184,12 +184,13 @@ class PGMExplainer(BaseRandom):
     def forward_pass(self, data, epoch, do_sampling):
         x_level = 'geometric'
         clf_logits = self.clf(data)
-        batch_edge_imp = []
+        batch_imp = []
         for graph in data.to_data_list():
-            edge_imp = self.explain_graph(graph, x_level)
-            batch_edge_imp += [edge_imp]
+            node_imp = self.explain_graph(graph, x_level)
+            batch_imp += [node_imp]
         # imp = self.explain_graph(data, x_level)
-        return -1, {}, clf_logits, torch.cat(batch_edge_imp)
+        res_weights = self.min_max_scalar(torch.cat(batch_imp))
+        return -1, {}, clf_logits, res_weights
 
     def explain_graph(self, graph, x_level):
 

@@ -16,7 +16,7 @@ optimizer:
   emb_lr: 1.0e-3
   emb_wd: 1.0e-5
 
-egnn:
+dgcnn:
   n_layers: 4
   hidden_size: 64
   dropout_p: 0.2
@@ -47,9 +47,9 @@ lri_bern:
   act_type: relu
 
 lri_gaussian:
-  epochs: 100
-  warmup: 0
-  pos_coef: 10
+  epochs: 50
+  warmup: 50
+  pos_coef: 15
   info_loss_coef: 0.01
 
   # not tuned
@@ -66,7 +66,7 @@ vgib:
   epochs: 50
   warmup: 50
   mi_loss_coef: 0.0001
-  reg_loss_coef: 1
+  reg_loss_coef: 0.1
   noise_loss_coef: 10
   dropout_p: 0.2
   norm_type: batch
@@ -77,10 +77,10 @@ test:
   epochs: 300
 
 ciga:
-  warmup: 100
-  epochs: 200
-  contrast_loss_coef: 10
-  hinge_loss_coef: 1
+  warmup: 0
+  epochs: 100
+  contrast_loss_coef: 5
+  hinge_loss_coef: 0.1
   causal_ratio: 0.3
   dropout_p: 0.2
   norm_type: batch
@@ -122,14 +122,14 @@ subgraphx:
   use_pruning: true
 
 pgmexplainer:
-  epochs: 1
+  epochs: 3
   pred_threshold: 0.3
   perturb_mode: split
   percentage: 20
 
 pgexplainer:
-  size_loss_coef: 0.01
-  mask_ent_loss_coef: 0.01
+  size_loss_coef: 0.1
+  mask_ent_loss_coef: 0.1
 
   epochs: 70
   warmup: 300
@@ -140,8 +140,8 @@ pgexplainer:
   act_type: relu
 
 gnnexplainer:
-  size_loss_coef: 0.1
-  mask_ent_loss_coef: 0.01
+  size_loss_coef: 0.01
+  mask_ent_loss_coef: 0.1
   iter_lr: 1.0e-1
 
   epochs: 1

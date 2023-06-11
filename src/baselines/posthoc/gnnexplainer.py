@@ -63,7 +63,7 @@ class GNNExplainer(BaseRandom):
             optimizer.zero_grad()
             node_mask = torch.sigmoid(self.node_mask)
             edge_mask = self.node_attn_to_edge_attn(node_mask, edge_index)
-            masked_clf_logits = self.clf(data, edge_attn=edge_mask, node_attn=node_mask)
+            masked_clf_logits = self.clf(data, edge_attn=edge_mask)
             loss, loss_dict = self.__loss__(self.node_mask.sigmoid(), masked_clf_logits, original_clf_logits.sigmoid(), epoch)
             loss.backward()
             optimizer.step()
